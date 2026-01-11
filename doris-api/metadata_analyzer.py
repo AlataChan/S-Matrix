@@ -4,6 +4,7 @@
 """
 import os
 import json
+import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime
 from db import doris_client
@@ -19,6 +20,10 @@ class MetadataAnalyzer:
         self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
         self.base_url = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
     
+    async def analyze_table_async(self, table_name: str, source_type: str = 'excel') -> Dict[str, Any]:
+        """异步分析表格元数据"""
+        return await asyncio.to_thread(self.analyze_table, table_name, source_type)
+
     def analyze_table(self, table_name: str, source_type: str = 'excel') -> Dict[str, Any]:
         """
         分析表格元数据
@@ -37,12 +42,21 @@ class MetadataAnalyzer:
             }
         
         try:
+            # 校验表名
+            safe_table_name = self.db.validate_identifier(table_name)
+            
             # 1. 获取表结构
             schema = self.db.get_table_schema(table_name)
             columns = [col['Field'] for col in schema]
             
             # 2. 获取样本数据 (前10行)
-            sample_sql = f"SELECT * FROM `{table_name}` LIMIT 10"
+            # 使用 safe_table_name，注意它已经包含了反引号，但我们的 validate_identifier 返回的是 `table`
+            # 这里的 sample_sql 是 f"SELECT * FROM `{table_name}` ..."
+            # 如果 validate_identifier 返回 "`table`"，那么 SQL 变成 "SELECT * FROM `table`" 是对的
+            # 但如果 validate_identifier 返回的是不带反引号的 safe string？
+            # 看 db.py: return f"`{identifier}`"
+            # 所以这里不需要再加反引号
+            sample_sql = f"SELECT * FROM {safe_table_name} LIMIT 10"
             sample_data = self.db.execute_query(sample_sql)
             
             # 3. 构造 prompt
@@ -204,23 +218,40 @@ class MetadataAnalyzer:
 
         return results
 
+    def _list_table_registry(self) -> list:
+        """List table registry entries for display name/description."""
+        try:
+            sql = "SELECT table_name, display_name, description FROM `_sys_table_registry`"
+            return self.db.execute_query(sql)
+        except Exception:
+            return []
+
     def get_all_tables_context(self) -> str:
         """
-        获取所有表格的上下文信息，用于增强 AI 问答
+        ??????????????????????????????????????????????????? AI ??????
         """
-        metadata_list = self.list_all_metadata()
-
-        if not metadata_list:
+        registry_list = self._list_table_registry()
+        if not registry_list:
             return ""
 
-        context_parts = ["以下是数据库中可用的表格信息：\n"]
+        metadata_map = {meta.get('table_name'): meta for meta in self.list_all_metadata()}
+        context_parts = ["?????????????????????????????????????????????\n"]
 
-        for meta in metadata_list:
-            context_parts.append(f"- 表名: {meta['table_name']}")
-            context_parts.append(f"  描述: {meta.get('description', '无描述')}")
+        for reg in registry_list:
+            table_name = reg.get('table_name')
+            if not table_name:
+                continue
+            meta = metadata_map.get(table_name, {})
+            display_name = reg.get('display_name') or table_name
+            description = reg.get('description') or meta.get('description') or '?????????'
+
+            context_parts.append(f"- ??????: {table_name}")
+            if display_name != table_name:
+                context_parts.append(f"  ?????????: {display_name}")
+            context_parts.append(f"  ??????: {description}")
             if meta.get('columns_info'):
                 cols = ", ".join(meta['columns_info'].keys())
-                context_parts.append(f"  主要字段: {cols}")
+                context_parts.append(f"  ????????????: {cols}")
             context_parts.append("")
 
         return "\n".join(context_parts)

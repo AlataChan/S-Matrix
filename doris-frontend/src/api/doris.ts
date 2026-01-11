@@ -7,7 +7,8 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,
+  // 增加超时时间到 5 分钟，以支持大数据量同步
+  timeout: 300000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -78,6 +79,11 @@ export interface UpdateSyncTaskRequest {
   schedule_day_of_week?: number;
   schedule_day_of_month?: number;
   enabled_for_ai?: boolean;
+}
+
+export interface UpdateTableRegistryRequest {
+  display_name?: string;
+  description?: string;
 }
 
 export const dorisApi = {
@@ -177,6 +183,14 @@ export const dorisApi = {
     get: (tableName: string) => api.get(`/api/tables/${tableName}/metadata`),
     // 获取所有元数据
     list: () => api.get('/api/metadata'),
+  },
+
+
+  // ??????????????????
+  tableRegistry: {
+    list: () => api.get('/api/table-registry'),
+    update: (tableName: string, data: UpdateTableRegistryRequest) =>
+      api.put(`/api/table-registry/${tableName}`, data),
   },
 };
 

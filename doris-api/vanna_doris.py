@@ -2,6 +2,7 @@
 Vanna.AI integration for Apache Doris
 """
 import os
+import json
 from typing import List, Dict, Any, Optional
 from vanna.base import VannaBase
 from db import DorisClient
@@ -33,6 +34,21 @@ class VannaDoris(VannaBase):
         # Already connected via doris_client, this is just for compatibility
         pass
     
+    async def run_sql_async(self, sql: str) -> Any:
+        """
+        Asynchronously execute SQL query on Doris
+        """
+        try:
+            # Remove any trailing semicolons
+            sql = sql.strip().rstrip(';')
+            
+            # Execute query using DorisClient
+            results = await self.doris_client.execute_query_async(sql)
+            
+            return results
+        except Exception as e:
+            raise Exception(f"Error executing SQL: {str(e)}")
+
     def run_sql(self, sql: str) -> Any:
         """
         Execute SQL query on Doris
@@ -85,42 +101,93 @@ class VannaDoris(VannaBase):
     
     def get_related_ddl(self, question: str, **kwargs) -> List[str]:
         """
-        Get DDL statements for tables related to the question
-        
-        Args:
-            question: Natural language question
-            
-        Returns:
-            List of DDL statements
+        Get DDL statements for tables related to the question.
+        Optimized to use information_schema for batch retrieval.
         """
         try:
-            # Get all tables
-            tables = self.get_table_names()
+            # 1. 尝试从元数据表中获取相关的表（如果有简单的关键词匹配最好，这里暂时全量但限制数量）
+            # 为了避免 Prompt 过大，我们限制最多返回 20 张表
+            limit = 20
             
+            # 使用 information_schema 批量获取 Schema，避免 N+1 查询
+            # 获取当前数据库的所有 Base Table
+            sql = f"""
+            SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = '{self.doris_client.config['database']}'
+            ORDER BY TABLE_NAME, ORDINAL_POSITION
+            """
+            
+            # 这里虽然是同步调用，但在 vanna 流程中是在线程池里跑的（我们在 main.py 做了 to_thread）
+            # 但为了保险，还是应该尽量快
+            results = self.doris_client.execute_query(sql)
+            
+            tables_schema = {}
+            for row in results:
+                table = row['TABLE_NAME']
+                if table not in tables_schema:
+                    tables_schema[table] = []
+                tables_schema[table].append(row)
+            
+            # 限制表数量，优先取有元数据的表（如果能关联的话），这里简单截断
+            # 更好的做法是根据 question 进行关键词过滤
+            relevant_tables = list(tables_schema.keys())
+            
+            # 简单的关键词匹配过滤
+            keywords = [w.lower() for w in question.split() if len(w) > 1]
+            if keywords:
+                scored_tables = []
+                for table in relevant_tables:
+                    score = 0
+                    table_lower = table.lower()
+                    for kw in keywords:
+                        if kw in table_lower:
+                            score += 5 # 表名匹配权重高
+                    
+                    # 检查列名匹配
+                    for col in tables_schema[table]:
+                        col_name = col['COLUMN_NAME'].lower()
+                        col_comment = (col.get('COLUMN_COMMENT') or '').lower()
+                        for kw in keywords:
+                            if kw in col_name:
+                                score += 1
+                            if kw in col_comment:
+                                score += 1
+                    
+                    scored_tables.append((score, table))
+                
+                # 按分数排序
+                scored_tables.sort(key=lambda x: x[0], reverse=True)
+                # 取前 limit 个，或者分数 > 0 的
+                relevant_tables = [t for s, t in scored_tables[:limit] if s > 0]
+                
+                # 如果没有匹配的，回退到取前几个
+                if not relevant_tables:
+                    relevant_tables = list(tables_schema.keys())[:5]
+            else:
+                relevant_tables = relevant_tables[:limit]
+
             ddl_statements = []
-            for table in tables:
-                try:
-                    # Get table schema
-                    schema = self.get_table_schema(table)
-                    
-                    # Build CREATE TABLE statement
-                    columns = []
-                    for col in schema:
-                        col_def = f"`{col['Field']}` {col['Type']}"
-                        if col.get('Null') == 'NO':
-                            col_def += " NOT NULL"
-                        if col.get('Default'):
-                            col_def += f" DEFAULT {col['Default']}"
-                        columns.append(col_def)
-                    
-                    ddl = f"CREATE TABLE `{table}` (\n  " + ",\n  ".join(columns) + "\n);"
-                    ddl_statements.append(ddl)
-                except:
-                    continue
+            for table in relevant_tables:
+                columns = []
+                for col in tables_schema[table]:
+                    col_def = f"`{col['COLUMN_NAME']}` {col['DATA_TYPE']}"
+                    if col['IS_NULLABLE'] == 'NO':
+                        col_def += " NOT NULL"
+                    if col['COLUMN_DEFAULT']:
+                        col_def += f" DEFAULT {col['COLUMN_DEFAULT']}"
+                    if col.get('COLUMN_COMMENT'):
+                        col_def += f" COMMENT '{col['COLUMN_COMMENT']}'"
+                    columns.append(col_def)
+                
+                ddl = f"CREATE TABLE `{table}` (\n  " + ",\n  ".join(columns) + "\n);"
+                ddl_statements.append(ddl)
             
             return ddl_statements
         except Exception as e:
-            raise Exception(f"Error getting DDL: {str(e)}")
+            # Fallback to empty list or basic implementation if information_schema fails
+            print(f"Error optimizing DDL retrieval: {e}")
+            return []
     
     def get_related_documentation(self, question: str, **kwargs) -> List[str]:
         """
@@ -132,9 +199,48 @@ class VannaDoris(VannaBase):
         Returns:
             List of documentation strings
         """
-        # For now, return empty list
-        # Can be extended to include custom documentation
-        return []
+        try:
+            sql = """
+            SELECT r.table_name, r.display_name, r.description,
+                   m.description AS auto_description, m.columns_info
+            FROM `_sys_table_registry` r
+            LEFT JOIN `_sys_table_metadata` m ON r.table_name = m.table_name
+            ORDER BY r.updated_at DESC
+            LIMIT 50
+            """
+            rows = self.doris_client.execute_query(sql)
+        except Exception:
+            return []
+
+        docs: List[str] = []
+        for row in rows:
+            table_name = row.get('table_name')
+            if not table_name:
+                continue
+            display_name = row.get('display_name') or table_name
+            description = row.get('description') or row.get('auto_description') or ''
+
+            columns_info = {}
+            try:
+                columns_info = json.loads(row.get('columns_info') or '{}')
+            except Exception:
+                columns_info = {}
+
+            if not description and display_name == table_name and not columns_info:
+                continue
+
+            parts = [f"Table: {table_name}"]
+            if display_name != table_name:
+                parts.append(f"Display Name: {display_name}")
+            if description:
+                parts.append(f"Description: {description}")
+            if columns_info:
+                cols = ", ".join(list(columns_info.keys())[:20])
+                if cols:
+                    parts.append(f"Key Columns: {cols}")
+            docs.append("\n".join(parts))
+
+        return docs
 
     # Training data methods (required by VannaBase but not used in our implementation)
     def add_ddl(self, ddl: str, **kwargs) -> str:
@@ -503,4 +609,3 @@ class VannaDorisOpenAI(VannaDoris):
 
         result = response.json()
         return result['choices'][0]['message']['content']
-

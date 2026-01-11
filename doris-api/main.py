@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional
 import uvicorn
 import traceback
 import os
+import asyncio
 
 from config import API_HOST, API_PORT, DORIS_CONFIG
 from handlers import action_handler
@@ -244,7 +245,7 @@ async def execute_action(req: ExecuteRequest):
             params['column'] = req.column
         
         # 执行操作
-        result = action_handler.execute(req.action, params)
+        result = await action_handler.execute_async(req.action, params)
         return result
         
     except ValueError as e:
@@ -480,12 +481,14 @@ async def natural_language_query(request: Dict[str, Any]):
 
         # 使用 Vanna 生成 SQL
         logger.info("=== Generating SQL with Vanna.AI...")
-        generated_sql = vanna.generate_sql(question=query)
+        # Vanna 的 generate_sql 可能也是同步的，因为它可能要调 OpenAI API
+        # 如果 vanna 库本身是同步的，我们需要 to_thread
+        generated_sql = await asyncio.to_thread(vanna.generate_sql, question=query)
 
         logger.info(f"=== Generated SQL: {generated_sql}")
 
         # 执行生成的 SQL
-        query_result = vanna.run_sql(generated_sql)
+        query_result = await vanna.run_sql_async(generated_sql)
 
         logger.info(f"=== Query executed successfully, returned {len(query_result)} rows")
 
@@ -519,7 +522,7 @@ async def preview_excel_file(file: UploadFile = File(...), rows: int = 10):
     """预览 Excel 文件"""
     try:
         content = await file.read()
-        result = excel_handler.preview_excel(content, rows)
+        result = await excel_handler.preview_excel_async(content, rows)
 
         return {
             "success": True,
@@ -541,7 +544,7 @@ async def _analyze_table_async(table_name: str, source_type: str):
     import asyncio
     await asyncio.sleep(2)  # 等待数据完全写入
     try:
-        result = metadata_analyzer.analyze_table(table_name, source_type)
+        result = await metadata_analyzer.analyze_table_async(table_name, source_type)
         if result.get('success'):
             print(f"✅ 表格 '{table_name}' 元数据分析完成")
         else:
@@ -579,17 +582,20 @@ async def upload_excel(
         # 转换 create_table 字符串为布尔值
         create_table_bool = create_table.lower() in ('true', '1', 'yes')
 
-        result = excel_handler.import_excel(
+        result = await excel_handler.import_excel_async(
             file_content=content,
             table_name=table_name,
             column_mapping=mapping,
             create_table_if_not_exists=create_table_bool
         )
+        if result.get('success'):
+            await datasource_handler.ensure_table_registry_async(table_name, 'excel')
 
         # 自动触发元数据分析（异步，不阻塞返回）
         try:
             import asyncio
-            asyncio.create_task(_analyze_table_async(table_name, 'excel'))
+            if result.get('success'):
+                asyncio.create_task(_analyze_table_async(table_name, 'excel'))
         except Exception as analyze_error:
             print(f"⚠️ 元数据分析触发失败: {analyze_error}")
 
@@ -640,7 +646,7 @@ class SyncMultipleRequest(BaseModel):
 @app.post("/api/datasource/test")
 async def test_datasource_connection(req: DataSourceTestRequest):
     """测试数据源连接"""
-    result = datasource_handler.test_connection(
+    result = await datasource_handler.test_connection(
         host=req.host,
         port=req.port,
         user=req.user,
@@ -654,7 +660,7 @@ async def test_datasource_connection(req: DataSourceTestRequest):
 async def save_datasource(req: DataSourceSaveRequest):
     """保存数据源配置"""
     try:
-        result = datasource_handler.save_datasource(
+        result = await datasource_handler.save_datasource(
             name=req.name,
             host=req.host,
             port=req.port,
@@ -671,7 +677,7 @@ async def save_datasource(req: DataSourceSaveRequest):
 async def list_datasources():
     """获取所有数据源"""
     try:
-        datasources = datasource_handler.list_datasources()
+        datasources = await datasource_handler.list_datasources()
         return {
             "success": True,
             "datasources": datasources,
@@ -685,7 +691,7 @@ async def list_datasources():
 async def delete_datasource(ds_id: str):
     """删除数据源"""
     try:
-        result = datasource_handler.delete_datasource(ds_id)
+        result = await datasource_handler.delete_datasource(ds_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -696,12 +702,12 @@ async def get_datasource_tables(ds_id: str):
     """获取数据源中的表列表"""
     try:
         print(f"📋 获取数据源表列表: ds_id={ds_id}")
-        ds = datasource_handler.get_datasource(ds_id)
+        ds = await datasource_handler.get_datasource(ds_id)
         print(f"📋 数据源信息: {ds}")
         if not ds:
             raise HTTPException(status_code=404, detail="数据源不存在")
 
-        result = datasource_handler.get_remote_tables(
+        result = await datasource_handler.get_remote_tables(
             host=ds['host'],
             port=ds['port'],
             user=ds['user'],
@@ -723,7 +729,7 @@ async def get_datasource_tables(ds_id: str):
 async def sync_datasource_table(ds_id: str, req: SyncTableRequest):
     """同步单个表"""
     try:
-        result = datasource_handler.sync_table(
+        result = await datasource_handler.sync_table(
             ds_id=ds_id,
             source_table=req.source_table,
             target_table=req.target_table
@@ -734,6 +740,7 @@ async def sync_datasource_table(ds_id: str, req: SyncTableRequest):
         # 自动触发元数据分析
         target = req.target_table or req.source_table
         try:
+            await datasource_handler.ensure_table_registry_async(target, 'database_sync')
             import asyncio
             asyncio.create_task(_analyze_table_async(target, 'database_sync'))
         except Exception as analyze_error:
@@ -750,7 +757,7 @@ async def sync_datasource_table(ds_id: str, req: SyncTableRequest):
 async def sync_multiple_tables(ds_id: str, req: SyncMultipleRequest):
     """批量同步多个表"""
     try:
-        result = datasource_handler.sync_multiple_tables(
+        result = await datasource_handler.sync_multiple_tables(
             ds_id=ds_id,
             tables=req.tables
         )
@@ -762,6 +769,7 @@ async def sync_multiple_tables(ds_id: str, req: SyncMultipleRequest):
                 if table_result.get('success'):
                     target = table_result.get('target_table')
                     try:
+                        await datasource_handler.ensure_table_registry_async(target, 'database_sync')
                         asyncio.create_task(_analyze_table_async(target, 'database_sync'))
                     except Exception as e:
                         print(f"⚠️ 元数据分析触发失败: {e}")
@@ -777,11 +785,11 @@ async def sync_multiple_tables(ds_id: str, req: SyncMultipleRequest):
 async def preview_datasource_table(ds_id: str, table_name: str, limit: int = 100):
     """预览远程表的结构和数据"""
     try:
-        ds = datasource_handler.get_datasource(ds_id)
+        ds = await datasource_handler.get_datasource(ds_id)
         if not ds:
             raise HTTPException(status_code=404, detail="数据源不存在")
 
-        result = datasource_handler.preview_remote_table(
+        result = await datasource_handler.preview_remote_table(
             host=ds['host'],
             port=ds['port'],
             user=ds['user'],
@@ -822,11 +830,18 @@ class UpdateSyncTaskRequest(BaseModel):
     enabled_for_ai: Optional[bool] = Field(None, description="是否启用AI分析")
 
 
+
+
+class UpdateTableRegistryRequest(BaseModel):
+    """????????????????????????"""
+    display_name: Optional[str] = Field(None, description="????????????")
+    description: Optional[str] = Field(None, description="?????????")
+
 @app.post("/api/sync/schedule")
 async def create_sync_schedule(req: ScheduleSyncRequest):
     """创建定时同步任务"""
     try:
-        result = datasource_handler.save_sync_task(
+        result = await datasource_handler.save_sync_task(
             ds_id=req.datasource_id,
             source_table=req.source_table,
             target_table=req.target_table,
@@ -846,7 +861,7 @@ async def create_sync_schedule(req: ScheduleSyncRequest):
 async def update_sync_task(task_id: str, req: UpdateSyncTaskRequest):
     """更新同步任务配置"""
     try:
-        result = datasource_handler.update_sync_task(
+        result = await datasource_handler.update_sync_task(
             task_id=task_id,
             schedule_type=req.schedule_type,
             schedule_minute=req.schedule_minute,
@@ -864,7 +879,7 @@ async def update_sync_task(task_id: str, req: UpdateSyncTaskRequest):
 async def toggle_task_ai(task_id: str, enabled: bool):
     """切换同步任务的AI分析启用状态"""
     try:
-        result = datasource_handler.toggle_ai_enabled(task_id, enabled)
+        result = await datasource_handler.toggle_ai_enabled(task_id, enabled)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -874,7 +889,7 @@ async def toggle_task_ai(task_id: str, enabled: bool):
 async def list_sync_tasks():
     """获取所有同步任务"""
     try:
-        tasks = datasource_handler.list_sync_tasks()
+        tasks = await datasource_handler.list_sync_tasks()
         return {
             "success": True,
             "tasks": tasks,
@@ -888,7 +903,7 @@ async def list_sync_tasks():
 async def get_ai_enabled_tables():
     """获取所有启用AI分析的表名"""
     try:
-        tables = datasource_handler.get_ai_enabled_tables()
+        tables = await datasource_handler.get_ai_enabled_tables()
         return {
             "success": True,
             "tables": tables,
@@ -902,7 +917,7 @@ async def get_ai_enabled_tables():
 async def delete_sync_task(task_id: str):
     """删除同步任务"""
     try:
-        result = datasource_handler.delete_sync_task(task_id)
+        result = await datasource_handler.delete_sync_task(task_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -914,7 +929,7 @@ async def delete_sync_task(task_id: str):
 async def analyze_table_metadata(table_name: str, source_type: str = "manual"):
     """分析表格元数据"""
     try:
-        result = metadata_analyzer.analyze_table(table_name, source_type)
+        result = await metadata_analyzer.analyze_table_async(table_name, source_type)
         if not result.get('success'):
             raise HTTPException(status_code=500, detail=result.get('error'))
         return result
@@ -957,6 +972,41 @@ async def list_all_metadata():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+# ============ ??????????????????API ============
+
+@app.get("/api/table-registry")
+async def list_table_registry():
+    """???????????????????????????"""
+    try:
+        tables = await datasource_handler.list_table_registry()
+        return {
+            "success": True,
+            "tables": tables,
+            "count": len(tables)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/table-registry/{table_name}")
+async def update_table_registry(table_name: str, req: UpdateTableRegistryRequest):
+    """????????????????????????????????????"""
+    try:
+        result = await datasource_handler.update_table_registry(
+            table_name=table_name,
+            display_name=req.display_name,
+            description=req.description
+        )
+        if not result.get('success'):
+            raise HTTPException(status_code=400, detail=result.get('error'))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
@@ -964,4 +1014,3 @@ if __name__ == "__main__":
         port=API_PORT,
         reload=True
     )
-

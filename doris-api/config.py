@@ -30,5 +30,19 @@ API_HOST = '0.0.0.0'
 API_PORT = 8000
 
 # 上传文件限制
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1GB
+
+# 同步与 Stream Load 限制
+DORIS_MAX_COLUMNS = int(os.getenv('DORIS_MAX_COLUMNS', '1024'))
+SYNC_BASE_CHUNK_ROWS = int(os.getenv('SYNC_BASE_CHUNK_ROWS', '200000'))
+SYNC_MIN_CHUNK_ROWS = int(os.getenv('SYNC_MIN_CHUNK_ROWS', '1000'))
+SYNC_MAX_CELLS = int(os.getenv('SYNC_MAX_CELLS', '50000000'))
+STREAM_LOAD_BATCH_ROWS = int(os.getenv('STREAM_LOAD_BATCH_ROWS', '50000'))
+STREAM_LOAD_MAX_BYTES = int(os.getenv('STREAM_LOAD_MAX_BYTES', str(256 * 1024 * 1024)))
+STREAM_LOAD_TIMEOUT = int(os.getenv('STREAM_LOAD_TIMEOUT', '600'))
+
+# 数据库连接超时配置（秒）
+DB_CONNECT_TIMEOUT = int(os.getenv('DB_CONNECT_TIMEOUT', '60'))
+DB_READ_TIMEOUT = int(os.getenv('DB_READ_TIMEOUT', '600'))  # 10分钟，支持大表同步
+DB_WRITE_TIMEOUT = int(os.getenv('DB_WRITE_TIMEOUT', '60'))
 

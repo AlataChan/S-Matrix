@@ -84,12 +84,16 @@
               :dataSource="remoteTables"
               :columns="tableColumns"
               :loading="tablesLoading"
-              :row-selection="{ selectedRowKeys: selectedTables, onChange: onTableSelectChange }"
+              :row-selection="rowSelection"
               :row-key="(record: any) => record.name"
               size="small"
               :pagination="{ pageSize: 10 }"
             >
               <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'sync_status'">
+                  <a-tag v-if="isTableSynced(record.name)" color="green">已同步</a-tag>
+                  <a-tag v-else>未同步</a-tag>
+                </template>
                 <template v-if="column.key === 'row_count'">
                   <a-tag color="blue">{{ record.row_count || 0 }} 行</a-tag>
                 </template>
@@ -136,11 +140,54 @@
               v-if="syncResult"
               :type="syncResult.success ? 'success' : 'error'"
               :message="syncResult.success ? '同步完成' : '同步失败'"
-              :description="syncResultDescription"
               style="margin-top: 16px"
               show-icon
               closable
-            />
+            >
+              <template #description>
+                <div v-if="syncResult.success">
+                  <p style="margin-bottom: 8px">{{ syncResultDescription }}</p>
+                  <a-collapse v-if="syncResult.results && syncResult.results.length > 0" :bordered="false" size="small">
+                    <a-collapse-panel key="1" header="查看详情">
+                      <a-list :data-source="syncResult.results" size="small">
+                        <template #renderItem="{ item }">
+                          <a-list-item>
+                            <a-list-item-meta>
+                              <template #title>
+                                <a-tag :color="item.success ? 'green' : 'red'">
+                                  {{ item.source_table }}
+                                </a-tag>
+                              </template>
+                              <template #description>
+                                <span v-if="item.success">
+                                  同步 {{ item.rows_synced || 0 }} 行
+                                  <a-tag v-if="item.table_created" color="blue" size="small">新建表</a-tag>
+                                  <a-tag v-if="item.incremental" color="cyan" size="small">增量同步</a-tag>
+                                </span>
+                                <span v-else style="color: #f5222d">{{ item.error }}</span>
+                              </template>
+                            </a-list-item-meta>
+                          </a-list-item>
+                        </template>
+                      </a-list>
+                    </a-collapse-panel>
+                  </a-collapse>
+                </div>
+                <div v-else>{{ syncResultDescription }}</div>
+              </template>
+            </a-alert>
+
+            <!-- 同步进行中提示 -->
+            <a-alert
+              v-if="syncLoading"
+              type="info"
+              message="正在同步..."
+              description="大表同步可能需要几分钟时间，请耐心等待"
+              style="margin-top: 16px"
+              show-icon
+            >
+              <template #icon><loading-outlined spin /></template>
+            </a-alert>
           </div>
         </a-card>
       </a-col>
@@ -257,7 +304,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
 import { message } from 'ant-design-vue';
-import { SyncOutlined, EyeOutlined, SettingOutlined } from '@ant-design/icons-vue';
+import { SyncOutlined, EyeOutlined, SettingOutlined, LoadingOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
 import dayjs, { Dayjs } from 'dayjs';
 
@@ -278,6 +325,11 @@ const selectedDatasource = ref<any>(null);
 const remoteTables = ref<any[]>([]);
 const selectedTables = ref<string[]>([]);
 const syncTasks = ref<any[]>([]);
+const syncedTableNames = ref<Set<string>>(new Set());
+
+const isTableSynced = (tableName: string): boolean => {
+  return syncedTableNames.value.has(tableName);
+};
 
 // 同步结果
 const syncResult = ref<any>(null);
@@ -292,6 +344,7 @@ const syncLoading = ref(false);
 // 表格列定义
 const tableColumns = [
   { title: '表名', dataIndex: 'name', key: 'name' },
+  { title: '状态', key: 'sync_status', width: 90 },
   { title: '行数', dataIndex: 'row_count', key: 'row_count', width: 100 },
   { title: 'AI分析', key: 'ai_enabled', width: 80 },
   { title: '操作', key: 'actions', width: 150 },
@@ -441,12 +494,18 @@ const selectDataSource = async (ds: any) => {
 
   tablesLoading.value = true;
   try {
-    const [tablesRes, tasksRes] = await Promise.all([
+    const [tablesRes, tasksRes, registryRes] = await Promise.all([
       dorisApi.datasource.getTables(ds.id),
-      dorisApi.syncTasks.list()
+      dorisApi.syncTasks.list(),
+      dorisApi.tableRegistry.list(),
     ]);
     remoteTables.value = tablesRes.data.tables || [];
     syncTasks.value = tasksRes.data.tasks || [];
+    const registryTables = registryRes.data.tables || [];
+    const synced = registryTables
+      .filter((t: any) => t?.source_type === 'database_sync' && t?.table_name)
+      .map((t: any) => t.table_name);
+    syncedTableNames.value = new Set(synced);
   } catch (error: any) {
     message.error('获取表列表失败: ' + (error.response?.data?.detail || error.message));
   } finally {
@@ -473,6 +532,14 @@ const deleteDataSource = async (dsId: string) => {
 const onTableSelectChange = (keys: string[]) => {
   selectedTables.value = keys;
 };
+
+const rowSelection = computed(() => ({
+  selectedRowKeys: selectedTables.value,
+  onChange: onTableSelectChange,
+  getCheckboxProps: (record: any) => ({
+    disabled: isTableSynced(record?.name),
+  }),
+}));
 
 // 获取表的AI启用状态
 const getTableAIEnabled = (tableName: string): boolean => {
@@ -624,11 +691,17 @@ const startSync = async () => {
     return;
   }
 
+  const tablesToSync = selectedTables.value.filter((name) => !isTableSynced(name));
+  if (tablesToSync.length === 0) {
+    message.info('所选表已同步，请使用“配置”设置同步周期');
+    return;
+  }
+
   syncLoading.value = true;
   syncResult.value = null;
 
   try {
-    const tables = selectedTables.value.map(name => ({ source_table: name }));
+    const tables = tablesToSync.map(name => ({ source_table: name }));
     const response = await dorisApi.datasource.syncMultiple(selectedDatasource.value.id, tables);
     syncResult.value = response.data;
 
@@ -637,6 +710,16 @@ const startSync = async () => {
     } else {
       message.warning(`同步部分失败：成功 ${response.data.success_count}，失败 ${response.data.fail_count}`);
     }
+
+    selectedTables.value = [];
+    const tasksRes = await dorisApi.syncTasks.list();
+    syncTasks.value = tasksRes.data.tasks || [];
+    const registryRes = await dorisApi.tableRegistry.list();
+    const registryTables = registryRes.data.tables || [];
+    const synced = registryTables
+      .filter((t: any) => t?.source_type === 'database_sync' && t?.table_name)
+      .map((t: any) => t.table_name);
+    syncedTableNames.value = new Set(synced);
   } catch (error: any) {
     syncResult.value = { success: false, error: error.response?.data?.detail || error.message };
     message.error('同步失败: ' + (error.response?.data?.detail || error.message));
