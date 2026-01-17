@@ -7,6 +7,7 @@ services:
     image: apache/doris:fe-4.0.0
     container_name: smatrix-fe
     hostname: smatrix-fe
+    restart: always
     environment:
       - FE_SERVERS=fe1:172.30.0.2:9010
       - FE_ID=1
@@ -24,14 +25,15 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 60s
+      retries: 10
+      start_period: 120s
 
   # Backend (BE) - 数据存储和查询执行
   smatrix-be:
     image: apache/doris:be-4.0.0
     container_name: smatrix-be
     hostname: smatrix-be
+    restart: always
     depends_on:
       smatrix-fe:
         condition: service_healthy
@@ -52,13 +54,14 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 60s
+      retries: 10
+      start_period: 120s
 
   # API Gateway
   smatrix-api:
     build: ./doris-api
     container_name: smatrix-api
+    restart: always
     ports:
       - "38018:8000"
     networks:
@@ -88,6 +91,7 @@ services:
       context: ./doris-frontend
       dockerfile: Dockerfile
     container_name: smatrix-frontend
+    restart: always
     ports:
       - "35173:80"
     networks:
