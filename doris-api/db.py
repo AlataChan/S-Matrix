@@ -4,8 +4,14 @@ Doris 数据库连接和查询工具
 import pymysql
 import asyncio
 import re
+import os
 from typing import List, Dict, Any, Union
 from config import DORIS_CONFIG
+
+try:
+    from dbutils.pooled_db import PooledDB
+except Exception:  # pragma: no cover - fallback for minimal envs
+    PooledDB = None
 
 
 class DorisClient:
@@ -13,9 +19,27 @@ class DorisClient:
     
     def __init__(self):
         self.config = DORIS_CONFIG
+        self._pool = None
+        self._pool_size = int(os.getenv("DORIS_POOL_SIZE", "10"))
+        self._use_pool = self._pool_size > 0
     
     def get_connection(self):
         """获取数据库连接"""
+        if self._use_pool and PooledDB is not None:
+            if self._pool is None:
+                self._pool = PooledDB(
+                    creator=pymysql,
+                    maxconnections=self._pool_size,
+                    blocking=True,
+                    ping=1,
+                    charset=self.config.get("charset", "utf8mb4"),
+                    host=self.config["host"],
+                    port=self.config["port"],
+                    user=self.config["user"],
+                    password=self.config["password"],
+                    database=self.config["database"],
+                )
+            return self._pool.connection()
         return pymysql.connect(**self.config)
     
     def validate_identifier(self, identifier: str) -> str:
@@ -136,4 +160,3 @@ class DorisClient:
 
 # 全局单例
 doris_client = DorisClient()
-

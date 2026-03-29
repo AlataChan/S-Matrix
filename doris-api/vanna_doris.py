@@ -3,10 +3,25 @@ Vanna.AI integration for Apache Doris
 """
 import os
 import json
+import hashlib
+import logging
+import re
+import uuid
 from typing import List, Dict, Any, Optional
 from vanna.base import VannaBase
 from db import DorisClient
-from config import DORIS_CONFIG
+from embedding import EmbeddingService
+
+try:
+    from cachetools import TTLCache
+except Exception:  # pragma: no cover - fallback for minimal envs
+    class TTLCache(dict):
+        def __init__(self, maxsize: int, ttl: int):
+            super().__init__()
+            self.maxsize = maxsize
+            self.ttl = ttl
+
+logger = logging.getLogger(__name__)
 
 
 class VannaDoris(VannaBase):
@@ -24,6 +39,18 @@ class VannaDoris(VannaBase):
         """
         VannaBase.__init__(self, config=config)
         self.doris_client = doris_client
+        self.embedding_service = EmbeddingService()
+        self._ddl_cache = TTLCache(maxsize=8, ttl=int(os.getenv("SMATRIX_DDL_CACHE_TTL", "300")))
+        self._enum_cache = TTLCache(maxsize=256, ttl=int(os.getenv("SMATRIX_ENUM_CACHE_TTL", "1800")))
+
+    def system_message(self, message: str) -> Dict[str, str]:
+        return {"role": "system", "content": message}
+
+    def user_message(self, message: str) -> Dict[str, str]:
+        return {"role": "user", "content": message}
+
+    def assistant_message(self, message: str) -> Dict[str, str]:
+        return {"role": "assistant", "content": message}
         
     def connect_to_doris(self, host: str = None, port: int = None, 
                          user: str = None, password: str = None, 
@@ -105,6 +132,9 @@ class VannaDoris(VannaBase):
         Optimized to use information_schema for batch retrieval.
         """
         try:
+            cache_key = f"{self.doris_client.config['database']}:information_schema.columns"
+            results = self._ddl_cache.get(cache_key)
+
             # 1. 尝试从元数据表中获取相关的表（如果有简单的关键词匹配最好，这里暂时全量但限制数量）
             # 为了避免 Prompt 过大，我们限制最多返回 20 张表
             limit = 20
@@ -117,10 +147,12 @@ class VannaDoris(VannaBase):
             WHERE TABLE_SCHEMA = '{self.doris_client.config['database']}'
             ORDER BY TABLE_NAME, ORDINAL_POSITION
             """
-            
-            # 这里虽然是同步调用，但在 vanna 流程中是在线程池里跑的（我们在 main.py 做了 to_thread）
-            # 但为了保险，还是应该尽量快
-            results = self.doris_client.execute_query(sql)
+
+            if results is None:
+                # 这里虽然是同步调用，但在 vanna 流程中是在线程池里跑的（我们在 main.py 做了 to_thread）
+                # 但为了保险，还是应该尽量快
+                results = self.doris_client.execute_query(sql)
+                self._ddl_cache[cache_key] = results
             
             tables_schema = {}
             for row in results:
@@ -202,9 +234,11 @@ class VannaDoris(VannaBase):
         try:
             sql = """
             SELECT r.table_name, r.display_name, r.description,
-                   m.description AS auto_description, m.columns_info
+                   m.description AS auto_description, m.columns_info,
+                   a.agent_config
             FROM `_sys_table_registry` r
             LEFT JOIN `_sys_table_metadata` m ON r.table_name = m.table_name
+            LEFT JOIN `_sys_table_agents` a ON r.table_name = a.table_name
             ORDER BY r.updated_at DESC
             LIMIT 50
             """
@@ -226,7 +260,13 @@ class VannaDoris(VannaBase):
             except Exception:
                 columns_info = {}
 
-            if not description and display_name == table_name and not columns_info:
+            agent_config = {}
+            try:
+                agent_config = json.loads(row.get('agent_config') or '{}')
+            except Exception:
+                agent_config = {}
+
+            if not description and display_name == table_name and not columns_info and not agent_config:
                 continue
 
             parts = [f"Table: {table_name}"]
@@ -238,6 +278,8 @@ class VannaDoris(VannaBase):
                 cols = ", ".join(list(columns_info.keys())[:20])
                 if cols:
                     parts.append(f"Key Columns: {cols}")
+            if agent_config:
+                parts.append(f"Agent Config: {json.dumps(agent_config, ensure_ascii=False)}")
             docs.append("\n".join(parts))
 
         return docs
@@ -252,8 +294,70 @@ class VannaDoris(VannaBase):
         return "Documentation storage not implemented"
 
     def add_question_sql(self, question: str, sql: str, **kwargs) -> str:
-        """Add question-SQL pair to training data (not implemented)"""
-        return "Question-SQL storage not implemented"
+        """Persist approved question-SQL pairs into Doris-backed history."""
+        normalized_sql = sql.strip().rstrip(";")
+        question_hash = self._compute_question_hash(question, normalized_sql)
+        duplicate_sql = """
+        SELECT COUNT(*) AS count
+        FROM `_sys_query_history`
+        WHERE `question_hash` = %s
+        """
+        duplicate_rows = self.doris_client.execute_query(duplicate_sql, (question_hash,))
+        duplicate_count = int((duplicate_rows[0] or {}).get("count", 0)) if duplicate_rows else 0
+        if duplicate_count > 0:
+            return "skipped"
+
+        table_names = kwargs.get("table_names") or self.extract_table_names(normalized_sql)
+        if isinstance(table_names, str):
+            table_names = [name.strip() for name in table_names.split(",") if name.strip()]
+
+        registered_tables = self._get_registered_tables()
+        unknown_tables = [table for table in table_names if table not in registered_tables]
+        if unknown_tables:
+            logger.warning("history write contains tables missing from registry: %s", unknown_tables)
+
+        record_id = kwargs.get("record_id") or str(uuid.uuid4())
+        row_count = int(kwargs.get("row_count", 0))
+        is_empty_result = bool(kwargs.get("is_empty_result", row_count == 0))
+        quality_gate = int(kwargs.get("quality_gate", 1))
+        question_embedding = kwargs.get("question_embedding") or self.generate_embedding(question)
+        embedding_literal = (
+            self.embedding_service.to_doris_array_literal(question_embedding)
+            if question_embedding
+            else None
+        )
+
+        insert_sql = """
+        INSERT INTO `_sys_query_history`
+        (`id`, `question`, `sql`, `table_names`, `question_hash`, `quality_gate`, `is_empty_result`, `row_count`, `created_at`)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """
+
+        params = (
+            record_id,
+            question,
+            normalized_sql,
+            ",".join(table_names),
+            question_hash,
+            quality_gate,
+            is_empty_result,
+            row_count,
+        )
+
+        if embedding_literal:
+            vector_insert_sql = f"""
+            INSERT INTO `_sys_query_history`
+            (`id`, `question`, `sql`, `table_names`, `question_hash`, `quality_gate`, `is_empty_result`, `row_count`, `question_embedding`, `created_at`)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {embedding_literal}, NOW())
+            """
+            try:
+                self.doris_client.execute_update(vector_insert_sql, params)
+                return "stored"
+            except Exception as vector_error:
+                logger.warning("vector history insert failed, fallback to scalar insert: %s", vector_error)
+
+        self.doris_client.execute_update(insert_sql, params)
+        return "stored"
 
     def get_training_data(self, **kwargs) -> Any:
         """Get training data (not implemented)"""
@@ -264,12 +368,103 @@ class VannaDoris(VannaBase):
         return True
 
     def generate_embedding(self, data: str, **kwargs) -> List[float]:
-        """Generate embedding for data (not implemented)"""
-        return []
+        """Generate embedding for semantic retrieval."""
+        return self.embedding_service.embed_text(data)
 
     def get_similar_question_sql(self, question: str, **kwargs) -> List[Dict[str, str]]:
-        """Get similar question-SQL pairs (not implemented)"""
-        return []
+        """Retrieve similar approved history rows using vector search with text fallback."""
+        limit = int(kwargs.get("limit", 3))
+        match_rows: List[Dict[str, Any]] = []
+
+        try:
+            question_embedding = self.generate_embedding(question)
+            vector_literal = self.embedding_service.to_doris_array_literal(question_embedding)
+            metric = os.getenv("SMATRIX_VECTOR_METRIC", "inner_product")
+            if metric == "l2_distance":
+                score_expr = f"l2_distance(`question_embedding`, {vector_literal})"
+                order_direction = "ASC"
+            else:
+                score_expr = f"inner_product(`question_embedding`, {vector_literal})"
+                order_direction = "DESC"
+
+            vector_sql = f"""
+            SELECT `question`, `sql`, `is_empty_result`, `created_at`, {score_expr} AS score
+            FROM `_sys_query_history`
+            WHERE `quality_gate` = 1
+              AND `question_embedding` IS NOT NULL
+            ORDER BY score {order_direction}, `is_empty_result` ASC, `created_at` DESC
+            LIMIT %s
+            """
+            match_rows = self.doris_client.execute_query(vector_sql, (limit,))
+        except Exception as vector_error:
+            logger.debug("vector retrieval unavailable, fallback to text search: %s", vector_error)
+            match_rows = []
+
+        if match_rows:
+            return [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+
+        match_sql = """
+        SELECT `question`, `sql`, `is_empty_result`, `created_at`
+        FROM `_sys_query_history`
+        WHERE `quality_gate` = 1
+          AND `question` MATCH_ANY %s
+        ORDER BY `is_empty_result` ASC, `created_at` DESC
+        LIMIT %s
+        """
+        try:
+            match_rows = self.doris_client.execute_query(match_sql, (question, limit))
+        except Exception:
+            match_rows = []
+
+        if not match_rows:
+            keywords = self._extract_search_keywords(question)
+            if not keywords:
+                return []
+
+            like_clauses = " OR ".join(["`question` LIKE %s"] * len(keywords))
+            like_sql = f"""
+            SELECT `question`, `sql`, `is_empty_result`, `created_at`
+            FROM `_sys_query_history`
+            WHERE `quality_gate` = 1
+              AND ({like_clauses})
+            ORDER BY `is_empty_result` ASC, `created_at` DESC
+            LIMIT %s
+            """
+            params = tuple(f"%{keyword}%" for keyword in keywords) + (limit,)
+            match_rows = self.doris_client.execute_query(like_sql, params)
+
+        return [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+
+    def extract_table_names(self, sql: str) -> List[str]:
+        """Best-effort extraction of table names from FROM/JOIN clauses."""
+        pattern = re.compile(
+            r"(?:from|join)\s+`?([a-zA-Z0-9_\-\u4e00-\u9fff]+)`?",
+            flags=re.IGNORECASE,
+        )
+        tables = {match.group(1) for match in pattern.finditer(sql)}
+        return sorted(tables)
+
+    def _compute_question_hash(self, question: str, sql: str) -> str:
+        payload = f"{question}{sql}".encode("utf-8")
+        return hashlib.md5(payload).hexdigest()
+
+    def _get_registered_tables(self) -> set[str]:
+        try:
+            rows = self.doris_client.execute_query("SELECT `table_name` FROM `_sys_table_registry`")
+        except Exception:
+            return set()
+        return {row.get("table_name") for row in rows if row.get("table_name")}
+
+    def _extract_search_keywords(self, question: str) -> List[str]:
+        compact = re.sub(r"\s+", "", question)
+        if not compact:
+            return []
+        keywords = []
+        if len(compact) <= 4:
+            keywords.append(compact)
+        else:
+            keywords.extend({compact[i : i + 2] for i in range(len(compact) - 1)})
+        return sorted({keyword for keyword in keywords if keyword})
     
     def get_column_sample_values(self, table_name: str, column_name: str, limit: int = 20) -> List[str]:
         """
@@ -284,10 +479,16 @@ class VannaDoris(VannaBase):
             List of distinct values
         """
         try:
+            cache_key = (table_name, column_name, limit)
+            if cache_key in self._enum_cache:
+                return list(self._enum_cache[cache_key])
+
             sql = f"SELECT DISTINCT `{column_name}` FROM `{table_name}` WHERE `{column_name}` IS NOT NULL LIMIT {limit}"
             results = self.run_sql(sql)
-            return [str(row[column_name]) for row in results if row.get(column_name)]
-        except:
+            values = [str(row[column_name]) for row in results if row.get(column_name)]
+            self._enum_cache[cache_key] = values
+            return values
+        except Exception:
             return []
 
     def get_sql_prompt(self, question: str, question_sql_list: List[Dict[str, str]],
@@ -429,8 +630,8 @@ class VannaDoris(VannaBase):
         # Get related documentation
         doc_list = self.get_related_documentation(question)
         
-        # Get example queries (empty for now, can be extended)
-        question_sql_list = []
+        question_sql_list = self.get_similar_question_sql(question)
+        logger.debug("[RAG] retrieved %s examples", len(question_sql_list))
         
         # Generate prompt
         prompt = self.get_sql_prompt(

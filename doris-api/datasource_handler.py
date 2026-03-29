@@ -7,6 +7,7 @@ import json
 import os
 import hashlib
 import asyncio
+import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from cryptography.fernet import Fernet
@@ -109,6 +110,67 @@ class DataSourceHandler:
         DISTRIBUTED BY HASH(`table_name`) BUCKETS 1
         PROPERTIES ("replication_num" = "1")
         """
+
+        sql_query_history = """
+        CREATE TABLE IF NOT EXISTS `_sys_query_history` (
+            `id` VARCHAR(36),
+            `question` TEXT,
+            `sql` TEXT,
+            `table_names` VARCHAR(1000),
+            `question_hash` VARCHAR(64),
+            `quality_gate` TINYINT DEFAULT "1",
+            `is_empty_result` BOOLEAN DEFAULT FALSE,
+            `row_count` INT,
+            `created_at` DATETIME
+        )
+        UNIQUE KEY(`id`)
+        DISTRIBUTED BY HASH(`id`) BUCKETS 1
+        PROPERTIES ("replication_num" = "1")
+        """
+
+        sql_table_agents = """
+        CREATE TABLE IF NOT EXISTS `_sys_table_agents` (
+            `table_name` VARCHAR(255),
+            `agent_config` TEXT,
+            `source_hash` VARCHAR(64),
+            `created_at` DATETIME,
+            `updated_at` DATETIME
+        )
+        UNIQUE KEY(`table_name`)
+        DISTRIBUTED BY HASH(`table_name`) BUCKETS 1
+        PROPERTIES ("replication_num" = "1")
+        """
+
+        sql_field_catalog = """
+        CREATE TABLE IF NOT EXISTS `_sys_field_catalog` (
+            `table_name` VARCHAR(255),
+            `field_name` VARCHAR(255),
+            `field_type` VARCHAR(50),
+            `enum_values` TEXT,
+            `value_range` VARCHAR(200),
+            `updated_at` DATETIME
+        )
+        UNIQUE KEY(`table_name`, `field_name`)
+        DISTRIBUTED BY HASH(`table_name`) BUCKETS 1
+        PROPERTIES ("replication_num" = "1")
+        """
+
+        sql_relationships = """
+        CREATE TABLE IF NOT EXISTS `_sys_table_relationships` (
+            `id` VARCHAR(36),
+            `table_a` VARCHAR(255),
+            `column_a` VARCHAR(255),
+            `table_b` VARCHAR(255),
+            `column_b` VARCHAR(255),
+            `rel_type` VARCHAR(50),
+            `confidence` FLOAT,
+            `is_manual` BOOLEAN DEFAULT FALSE,
+            `created_at` DATETIME
+        )
+        UNIQUE KEY(`id`)
+        DISTRIBUTED BY HASH(`id`) BUCKETS 1
+        PROPERTIES ("replication_num" = "1")
+        """
         
         import time
         max_retries = 10
@@ -118,6 +180,25 @@ class DataSourceHandler:
                 self.db.execute_update(sql_sync_tasks)
                 self.db.execute_update(sql_metadata)
                 self.db.execute_update(sql_table_registry)
+                self.db.execute_update(sql_query_history)
+                self.db.execute_update(sql_table_agents)
+                self.db.execute_update(sql_field_catalog)
+                self.db.execute_update(sql_relationships)
+
+                for index_sql in (
+                    "CREATE INDEX IF NOT EXISTS idx_query_history_hash ON `_sys_query_history` (`question_hash`) USING INVERTED",
+                    "CREATE INDEX IF NOT EXISTS idx_query_history_question ON `_sys_query_history` (`question`) USING INVERTED PROPERTIES(\"parser\"=\"chinese\")",
+                ):
+                    try:
+                        self.db.execute_update(index_sql)
+                    except Exception:
+                        pass
+
+                try:
+                    self.ensure_query_history_vector_support()
+                except Exception:
+                    pass
+
                 print("✅ 系统表创建成功")
                 return
             except Exception as e:
@@ -162,6 +243,113 @@ class DataSourceHandler:
             now
         ))
         return {'success': True, 'message': '表注册已创建', 'table_name': table_name}
+
+    def list_query_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT `id`, `question`, `sql`, `table_names`, `is_empty_result`, `row_count`, `created_at`
+        FROM `_sys_query_history`
+        WHERE `quality_gate` = 1
+        ORDER BY `created_at` DESC
+        LIMIT %s
+        """
+        return self.db.execute_query(sql, (limit,))
+
+    async def list_query_history_async(self, limit: int = 100) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_query_history, limit)
+
+    def update_query_feedback(self, query_id: str, quality_gate: int) -> Dict[str, Any]:
+        sql = """
+        UPDATE `_sys_query_history`
+        SET `quality_gate` = %s
+        WHERE `id` = %s
+        """
+        self.db.execute_update(sql, (quality_gate, query_id))
+        return {"success": True, "id": query_id, "quality_gate": quality_gate}
+
+    async def update_query_feedback_async(self, query_id: str, quality_gate: int) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.update_query_feedback, query_id, quality_gate)
+
+    def create_relationship(
+        self,
+        table_a: str,
+        column_a: str,
+        table_b: str,
+        column_b: str,
+        rel_type: str = "logical",
+        confidence: float = 1.0,
+        is_manual: bool = True,
+    ) -> Dict[str, Any]:
+        rel_id = str(uuid.uuid4())
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        sql = """
+        INSERT INTO `_sys_table_relationships`
+        (`id`, `table_a`, `column_a`, `table_b`, `column_b`, `rel_type`, `confidence`, `is_manual`, `created_at`)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        self.db.execute_update(
+            sql,
+            (rel_id, table_a, column_a, table_b, column_b, rel_type, confidence, is_manual, now),
+        )
+        return {
+            "success": True,
+            "relationship": {
+                "id": rel_id,
+                "table_a": table_a,
+                "column_a": column_a,
+                "table_b": table_b,
+                "column_b": column_b,
+                "rel_type": rel_type,
+                "confidence": confidence,
+                "is_manual": is_manual,
+            },
+        }
+
+    async def create_relationship_async(self, **kwargs) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.create_relationship, **kwargs)
+
+    def list_relationships(self, tables: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        if tables:
+            placeholders = ", ".join(["%s"] * len(tables))
+            sql = f"""
+            SELECT * FROM `_sys_table_relationships`
+            WHERE `table_a` IN ({placeholders}) OR `table_b` IN ({placeholders})
+            ORDER BY `is_manual` DESC, `confidence` DESC, `created_at` DESC
+            """
+            params = tuple(tables) + tuple(tables)
+            return self.db.execute_query(sql, params)
+        sql = """
+        SELECT * FROM `_sys_table_relationships`
+        ORDER BY `is_manual` DESC, `confidence` DESC, `created_at` DESC
+        """
+        return self.db.execute_query(sql)
+
+    async def list_relationships_async(self, tables: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_relationships, tables)
+
+    def ensure_query_history_vector_support(self, dimension: int = 512) -> Dict[str, Any]:
+        statements = [
+            "ALTER TABLE `_sys_query_history` ADD COLUMN `question_embedding` ARRAY<FLOAT>",
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_query_history_embedding
+            ON `_sys_query_history` (`question_embedding`)
+            USING ANN PROPERTIES(
+                "index_type"="hnsw",
+                "metric_type"="inner_product",
+                "dim"="{dimension}"
+            )
+            """,
+        ]
+
+        executed = []
+        for statement in statements:
+            try:
+                self.db.execute_update(statement)
+                executed.append(statement.strip())
+            except Exception:
+                # Doris may reject duplicate ALTER/INDEX creation or ANN on UNIQUE KEY tables.
+                pass
+
+        return {"success": True, "dimension": dimension, "statements": executed}
     
     def _encrypt_password(self, password: str) -> str:
         """加密密码"""
@@ -1149,6 +1337,13 @@ class SyncScheduler:
                 minutes=1,
                 id='sync_checker'
             )
+            self.scheduler.add_job(
+                self._refresh_agent_catalogs,
+                'cron',
+                hour=0,
+                minute=0,
+                id='field_catalog_refresh'
+            )
             self.scheduler.start()
             print("✅ 同步调度器已启动")
         except Exception as e:
@@ -1174,7 +1369,14 @@ class SyncScheduler:
         except Exception as e:
             print(f"❌ 任务检查失败: {e}")
 
+    def _refresh_agent_catalogs(self):
+        try:
+            from metadata_analyzer import metadata_analyzer
+
+            metadata_analyzer.refresh_all_field_catalogs()
+        except Exception as e:
+            print(f"⚠️ 字段目录刷新失败: {e}")
+
 
 # 全局调度器实例
 sync_scheduler = SyncScheduler(datasource_handler)
-
