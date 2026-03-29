@@ -10,6 +10,8 @@ import uvicorn
 import traceback
 import os
 import asyncio
+import logging
+import inspect
 
 from config import API_HOST, API_PORT, DORIS_CONFIG
 from handlers import action_handler
@@ -18,6 +20,10 @@ from upload_handler import excel_handler
 from vanna_doris import VannaDorisOpenAI
 from datasource_handler import datasource_handler, sync_scheduler
 from metadata_analyzer import metadata_analyzer
+from planner_agent import PlannerAgent
+from table_admin_agent import TableAdminAgent
+from coordinator_agent import CoordinatorAgent
+from repair_agent import RepairAgent
 
 app = FastAPI(
     title="Doris API Gateway",
@@ -28,11 +34,17 @@ app = FastAPI(
 
 # Global readiness flag for Doris init to avoid 502s after reboot.
 doris_ready = False
+logger = logging.getLogger(__name__)
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("SMATRIX_CORS_ORIGINS", "http://localhost:35173").split(",")
+    if origin.strip()
+]
 
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,8 +140,26 @@ async def startup_event():
 
 
 @app.middleware("http")
-async def doris_ready_middleware(request: Request, call_next):
+async def api_guard_middleware(request: Request, call_next):
     if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        expected_api_key = os.getenv("SMATRIX_API_KEY")
+        if not expected_api_key:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "message": "SMATRIX_API_KEY is not configured."},
+            )
+
+        provided_api_key = request.headers.get("X-API-Key")
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            provided_api_key = authorization.split(" ", 1)[1].strip()
+
+        if provided_api_key != expected_api_key:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "message": "Unauthorized"},
+            )
+
         if not doris_ready:
             return JSONResponse(
                 status_code=503,
@@ -479,37 +509,117 @@ async def natural_language_query(request: Dict[str, Any]):
                 detail="API key not provided. Please provide 'api_key' in request or set DEEPSEEK_API_KEY/OPENAI_API_KEY environment variable"
             )
 
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"=== Natural language query: {query}")
         logger.info(f"=== Using model: {model} at {base_url}")
 
-        # 初始化 Vanna
-        vanna = VannaDorisOpenAI(
+        api_config = {"api_key": api_key, "model": model, "base_url": base_url}
+        try:
+            tables_context = await datasource_handler.list_table_registry()
+        except Exception as registry_error:
+            logger.warning("failed to load table registry for planner, fallback to empty context: %s", registry_error)
+            tables_context = []
+
+        planner = PlannerAgent(tables_context=tables_context)
+        plan = await asyncio.to_thread(planner.plan, query)
+        subtasks = plan.get("subtasks") or [{"table": table, "question": query} for table in plan.get("tables", [])]
+        table_admin = TableAdminAgent(doris_client_override=doris_client)
+
+        sql_map: Dict[str, str] = {}
+        for subtask in subtasks:
+            table_name = subtask.get("table")
+            if not table_name:
+                continue
+            sql_map[table_name] = await asyncio.to_thread(
+                table_admin.generate_sql_for_subtask,
+                subtask,
+                query,
+                api_config,
+            )
+
+        if not sql_map:
+            raise HTTPException(status_code=400, detail="Planner could not resolve any target tables")
+
+        try:
+            relationships = await datasource_handler.list_relationships_async(plan.get("tables"))
+        except Exception as relationship_error:
+            logger.warning("failed to load relationships, fallback to none: %s", relationship_error)
+            relationships = []
+
+        coordinator = CoordinatorAgent()
+        coordinate_signature = inspect.signature(coordinator.coordinate)
+        if "relationships" in coordinate_signature.parameters:
+            generated_sql = await asyncio.to_thread(
+                coordinator.coordinate,
+                plan,
+                sql_map,
+                relationships=relationships,
+            )
+        else:
+            generated_sql = await asyncio.to_thread(coordinator.coordinate, plan, sql_map)
+
+        history_vanna = VannaDorisOpenAI(
             doris_client=doris_client,
             api_key=api_key,
             model=model,
             base_url=base_url,
-            config={'temperature': 0.1}  # 低温度以获得更确定的结果
+            config={'temperature': 0.1}
         )
-
-        # 使用 Vanna 生成 SQL
-        logger.info("=== Generating SQL with Vanna.AI...")
-        # Vanna 的 generate_sql 可能也是同步的，因为它可能要调 OpenAI API
-        # 如果 vanna 库本身是同步的，我们需要 to_thread
-        generated_sql = await asyncio.to_thread(vanna.generate_sql, question=query)
+        repair_agent = RepairAgent(
+            doris_client=doris_client,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
 
         logger.info(f"=== Generated SQL: {generated_sql}")
 
-        # 执行生成的 SQL
-        query_result = await vanna.run_sql_async(generated_sql)
+        final_sql = generated_sql
+        try:
+            query_result = await doris_client.execute_query_async(final_sql)
+        except Exception as execute_error:
+            logger.warning("=== SQL execution failed, starting repair flow: %s", execute_error)
+            if hasattr(history_vanna, "get_related_ddl"):
+                ddl_list = await asyncio.to_thread(history_vanna.get_related_ddl, query)
+            else:
+                ddl_list = []
+            last_error = execute_error
+
+            for _ in range(2):
+                repaired_sql = await asyncio.to_thread(
+                    repair_agent.repair_sql,
+                    query,
+                    final_sql,
+                    str(last_error),
+                    ddl_list,
+                    api_config=api_config,
+                )
+                final_sql = repaired_sql.strip().rstrip(";")
+                logger.info("=== Repaired SQL: %s", final_sql)
+                try:
+                    query_result = await doris_client.execute_query_async(final_sql)
+                    break
+                except Exception as retry_error:
+                    last_error = retry_error
+            else:
+                raise last_error
+
+        try:
+            await asyncio.to_thread(
+                history_vanna.add_question_sql,
+                question=query,
+                sql=final_sql,
+                row_count=len(query_result),
+                is_empty_result=len(query_result) == 0,
+            )
+        except Exception as history_error:
+            logger.warning("history persistence failed: %s", history_error)
 
         logger.info(f"=== Query executed successfully, returned {len(query_result)} rows")
 
         return {
             "success": True,
             "query": query,
-            "sql": generated_sql,
+            "sql": final_sql,
             "data": query_result,
             "count": len(query_result)
         }
@@ -517,8 +627,6 @@ async def natural_language_query(request: Dict[str, Any]):
     except HTTPException:
         raise
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"=== Error in natural language query: {str(e)}")
         logger.error(traceback.format_exc())
 
@@ -529,6 +637,58 @@ async def natural_language_query(request: Dict[str, Any]):
                 "traceback": traceback.format_exc()
             }
         )
+
+
+@app.get("/api/query/history")
+async def query_history(limit: int = 100):
+    """查询历史列表（只读）"""
+    try:
+        history = await datasource_handler.list_query_history_async(limit=limit)
+        return {
+            "success": True,
+            "history": history,
+            "count": len(history),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class QueryHistoryFeedbackRequest(BaseModel):
+    quality_gate: int = Field(..., description="质量门状态")
+
+
+class RelationshipRequest(BaseModel):
+    table_a: str
+    column_a: str
+    table_b: str
+    column_b: str
+    rel_type: Optional[str] = Field(default="logical")
+
+
+@app.post("/api/query/history/{query_id}/feedback")
+async def query_history_feedback(query_id: str, req: QueryHistoryFeedbackRequest):
+    """更新查询历史质量标记"""
+    try:
+        return await datasource_handler.update_query_feedback_async(query_id, req.quality_gate)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/relationships")
+async def create_relationship(req: RelationshipRequest):
+    """创建手工关系覆盖"""
+    try:
+        return await datasource_handler.create_relationship_async(
+            table_a=req.table_a,
+            column_a=req.column_a,
+            table_b=req.table_b,
+            column_b=req.column_b,
+            rel_type=req.rel_type or "logical",
+            confidence=1.0,
+            is_manual=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/upload/preview")
@@ -560,6 +720,7 @@ async def _analyze_table_async(table_name: str, source_type: str):
     try:
         result = await metadata_analyzer.analyze_table_async(table_name, source_type)
         if result.get('success'):
+            await asyncio.to_thread(metadata_analyzer.refresh_agent_assets, table_name, source_type)
             print(f"✅ 表格 '{table_name}' 元数据分析完成")
         else:
             print(f"⚠️ 表格 '{table_name}' 元数据分析失败: {result.get('error')}")
@@ -968,6 +1129,22 @@ async def get_table_metadata(table_name: str):
             "success": True,
             "metadata": metadata
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agents/{table_name}")
+async def get_table_agent(table_name: str):
+    """获取表 Agent 配置"""
+    try:
+        agent = metadata_analyzer.get_agent_config(table_name)
+        if not agent:
+            return {
+                "success": True,
+                "agent": None,
+                "message": "表 Agent 配置尚未生成，请先执行分析。"
+            }
+        return {"success": True, "agent": agent}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

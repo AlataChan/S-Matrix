@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "smatrix": {
+      "command": "python3",
+      "args": ["doris-api/mcp_server.py"],
+      "env": {
+        "SMATRIX_API_URL": "http://localhost:38018",
+        "SMATRIX_API_KEY": "${SMATRIX_API_KEY}"
+      }
+    }
+  }
+}
