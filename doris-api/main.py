@@ -1,10 +1,11 @@
 """
 Doris API Gateway - 主程序
 """
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Dict, Any, List, Optional
 import uvicorn
 import traceback
@@ -15,7 +16,7 @@ import logging
 import inspect
 from urllib.parse import urlsplit, urlunsplit
 
-from config import API_HOST, API_PORT, DORIS_CONFIG
+from config import API_HOST, API_PORT, DORIS_CONFIG, ANALYST_DEFAULT_DEPTH
 from handlers import action_handler
 from db import doris_client
 from upload_handler import excel_handler
@@ -26,16 +27,36 @@ from planner_agent import PlannerAgent
 from table_admin_agent import TableAdminAgent
 from coordinator_agent import CoordinatorAgent
 from repair_agent import RepairAgent
+from analyst_agent import AnalystAgent
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Application startup/shutdown lifecycle."""
+    async def init_in_background():
+        global doris_ready
+        if doris_ready:
+            return
+        ready = await asyncio.to_thread(_init_doris_sync)
+        if ready:
+            doris_ready = True
+            sync_scheduler.start()
+
+    asyncio.create_task(init_in_background())
+    yield
+
 
 app = FastAPI(
     title="Doris API Gateway",
     description="极简的 HTTP API Gateway for Apache Doris",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
 # Global readiness flag for Doris init to avoid 502s after reboot.
 doris_ready = False
+analyst_agent: Optional[AnalystAgent] = None
 logger = logging.getLogger(__name__)
 cors_origins = [
     origin.strip()
@@ -144,11 +165,30 @@ def resolve_llm_resource_config(resource_name: Optional[str] = None) -> Optional
     }
 
 
+def build_api_config(
+    resource_name: Optional[str] = None,
+    *,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    resource_config = resolve_llm_resource_config(resource_name)
+    return {
+        "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        "model": model or (resource_config or {}).get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "base_url": base_url or (resource_config or {}).get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "resource_name": (resource_config or {}).get("resource_name"),
+        "endpoint": (resource_config or {}).get("endpoint"),
+        "provider": (resource_config or {}).get("provider"),
+    }
+
+
 # ============ 启动事件 ============
 
 def _init_doris_sync():
     import time
     import pymysql
+    global analyst_agent
 
     retry_interval = int(os.getenv("DORIS_INIT_RETRY_INTERVAL", "2"))
     db_name = DORIS_CONFIG["database"]
@@ -203,6 +243,13 @@ def _init_doris_sync():
                 print(f"Retry in {retry_interval}s...")
                 time.sleep(retry_interval)
                 continue
+            if analyst_agent is None:
+                analyst_agent = AnalystAgent(doris_client, build_api_config)
+            if not analyst_agent.init_tables():
+                print("Analysis system tables are not ready yet")
+                print(f"Retry in {retry_interval}s...")
+                time.sleep(retry_interval)
+                continue
             print("System tables initialized")
 
             print("=" * 60)
@@ -217,24 +264,6 @@ def _init_doris_sync():
             print(f"Connect failed: {e}")
             print(f"Retry in {retry_interval}s...")
             time.sleep(retry_interval)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    Application startup initialization.
-    """
-    async def init_in_background():
-        global doris_ready
-        if doris_ready:
-            return
-        ready = await asyncio.to_thread(_init_doris_sync)
-        if ready:
-            doris_ready = True
-            sync_scheduler.start()
-
-    asyncio.create_task(init_in_background())
-
 
 @app.middleware("http")
 async def api_guard_middleware(request: Request, call_next):
@@ -278,17 +307,16 @@ class ExecuteRequest(BaseModel):
     column: Optional[str] = Field(None, description="列名")
     params: Optional[Dict[str, Any]] = Field(default_factory=dict, description="其他参数")
     
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "action": "sentiment",
-                "table": "customer_feedback",
-                "column": "feedback_text",
-                "params": {
-                    "limit": 50
-                }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "action": "sentiment",
+            "table": "customer_feedback",
+            "column": "feedback_text",
+            "params": {
+                "limit": 50
             }
         }
+    })
 
 
 _RESOURCE_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,127}$')
@@ -318,8 +346,9 @@ class LLMConfigRequest(BaseModel):
             )
         return v
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        json_schema_extra={
             "example": {
                 "resource_name": "my_openai",
                 "provider_type": "openai",
@@ -327,7 +356,31 @@ class LLMConfigRequest(BaseModel):
                 "model_name": "gpt-4",
                 "api_key": "sk-xxxxx"
             }
-        }
+        },
+    )
+
+
+class AnalysisTableRequest(BaseModel):
+    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep")
+    resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
+
+    @field_validator("depth")
+    @classmethod
+    def validate_depth(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"quick", "standard", "deep"}:
+            raise ValueError("depth must be one of quick, standard, deep")
+        return normalized
+
+
+class AnalysisReplayRequest(BaseModel):
+    resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
+
+
+def _require_analyst_agent() -> AnalystAgent:
+    if analyst_agent is None:
+        raise HTTPException(status_code=503, detail="Analyst agent is not initialized yet")
+    return analyst_agent
 
 
 class NLQueryRequest(BaseModel):
@@ -336,14 +389,13 @@ class NLQueryRequest(BaseModel):
     table_name: str = Field(..., description="目标表名")
     resource_name: Optional[str] = Field(None, description="LLM 资源名称,不指定则使用第一个可用资源")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "question": "2022年的机构中来自于广东的有多少个?分别是来自于广东那几个城市每个城市的占比是多少?",
-                "table_name": "中国环保公益组织现状调研数据2022.",
-                "resource_name": "my_deepseek"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "question": "2022年的机构中来自于广东的有多少个?分别是来自于广东那几个城市每个城市的占比是多少?",
+            "table_name": "中国环保公益组织现状调研数据2022.",
+            "resource_name": "my_deepseek"
         }
+    })
 
 
 # ============ API 路由 ============
@@ -624,20 +676,15 @@ async def natural_language_query(request: Dict[str, Any]):
             if str(table_name).strip()
         ]
 
-        resource_config = resolve_llm_resource_config(request.get("resource_name"))
-
-        # 获取 API 配置
-        api_key = request.get('api_key') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_API_KEY')
-        model = (
-            request.get('model')
-            or (resource_config or {}).get("model")
-            or os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
+        api_config = build_api_config(
+            request.get("resource_name"),
+            api_key=request.get("api_key"),
+            model=request.get("model"),
+            base_url=request.get("base_url"),
         )
-        base_url = (
-            request.get('base_url')
-            or (resource_config or {}).get("base_url")
-            or os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-        )
+        api_key = api_config.get("api_key")
+        model = api_config.get("model")
+        base_url = api_config.get("base_url")
 
         if not api_key:
             raise HTTPException(
@@ -648,14 +695,6 @@ async def natural_language_query(request: Dict[str, Any]):
         logger.info(f"=== Natural language query: {query}")
         logger.info(f"=== Using model: {model} at {base_url}")
 
-        api_config = {
-            "api_key": api_key,
-            "model": model,
-            "base_url": base_url,
-            "resource_name": (resource_config or {}).get("resource_name"),
-            "endpoint": (resource_config or {}).get("endpoint"),
-            "provider": (resource_config or {}).get("provider"),
-        }
         try:
             tables_context = await datasource_handler.list_table_registry()
         except Exception as registry_error:
@@ -801,6 +840,87 @@ async def natural_language_query(request: Dict[str, Any]):
                 "traceback": traceback.format_exc()
             }
         )
+
+
+@app.post("/api/analysis/table/{table_name}")
+async def analyze_table_endpoint(table_name: str, request: AnalysisTableRequest):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(
+            agent.analyze_table,
+            table_name,
+            request.depth,
+            request.resource_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/analysis/replay/{history_id}")
+async def analyze_replay_endpoint(history_id: str, request: AnalysisReplayRequest):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(
+            agent.replay_from_history,
+            history_id,
+            request.resource_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/analysis/reports")
+async def analysis_reports(table_names: Optional[str] = None, limit: int = 20, offset: int = 0):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(agent.list_reports, table_names, limit, offset)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/analysis/reports/latest/{table_name}")
+async def latest_analysis_report(table_name: str):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(agent.get_latest_report, table_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/analysis/reports/{report_id}")
+async def analysis_report_detail(report_id: str):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(agent.get_report, report_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/analysis/reports/{report_id}")
+async def analysis_report_delete(report_id: str):
+    agent = _require_analyst_agent()
+    try:
+        return await asyncio.to_thread(agent.delete_report, report_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/query/history")

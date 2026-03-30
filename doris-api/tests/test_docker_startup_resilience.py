@@ -99,6 +99,7 @@ def test_init_doris_sync_waits_until_system_tables_exist(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pymysql", SimpleNamespace(connect=lambda **kwargs: FakeConnection()))
     monkeypatch.setattr(main.datasource_handler, "init_tables", lambda: next(init_results))
+    main.analyst_agent = SimpleNamespace(init_tables=lambda: True)
     monkeypatch.setattr("time.sleep", lambda seconds: sleep_calls.append(seconds))
     monkeypatch.setenv("DORIS_INIT_RETRY_INTERVAL", "2")
 

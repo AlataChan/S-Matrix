@@ -46,3 +46,5 @@ DB_CONNECT_TIMEOUT = int(os.getenv('DB_CONNECT_TIMEOUT', '60'))
 DB_READ_TIMEOUT = int(os.getenv('DB_READ_TIMEOUT', '600'))  # 10分钟，支持大表同步
 DB_WRITE_TIMEOUT = int(os.getenv('DB_WRITE_TIMEOUT', '60'))
 
+# Analyst Agent (Phase 1)
+ANALYST_DEFAULT_DEPTH = os.getenv('ANALYST_DEFAULT_DEPTH', 'standard')
