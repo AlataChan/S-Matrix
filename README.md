@@ -1,8 +1,12 @@
-# Doris 数据中台 (Doris Data Platform)
+# S-Matrix 数据中台
 
-基于 Apache Doris 4.0 的智能数据中台,集成 Vanna.AI Text-to-SQL 功能,支持自然语言查询。
+基于 Apache Doris 4.0 的智能数据中台，集成 Vanna.AI Text-to-SQL，支持自然语言查询数据库。
 
-## 🚀 快速开始
+**架构**：多 Agent 查询引擎（Planner → TableAdmin → Coordinator → RepairAgent）
+
+---
+
+## 快速开始
 
 ### 前置要求
 
@@ -10,240 +14,208 @@
 - Docker Compose 2.0+
 - 至少 8GB 可用内存
 
-### 一键部署
+### 启动
 
 ```bash
-# 克隆仓库
-git clone https://github.com/sga-jerrylin/doris-sga.git
-cd doris-sga
+git clone https://github.com/sga-jerrylin/S-Matrix.git
+cd S-Matrix
 
-# 启动所有服务
+# 复制环境变量配置文件
+cp .env.example .env
+
+# 编辑 .env，填入必填项（见下方配置说明）
+vim .env
+
 docker-compose up -d
-
-# 查看启动日志
 docker-compose logs -f
 ```
 
-**就这么简单!** 🎉
+等待 2-3 分钟初始化完成。
 
-等待 2-3 分钟后,所有服务将自动启动并初始化。
+### 访问地址（宿主机端口）
 
-### 访问地址
-
-- **前端界面**: http://localhost:5173
-- **API 文档**: http://localhost:8018/docs
-- **Doris Web UI**: http://localhost:18030 (用户名: root, 密码: 空)
+| 服务 | 地址 |
+| ---- | ---- |
+| 前端界面 | <http://localhost:35173> |
+| API 文档 | <http://localhost:38018/docs> |
+| Doris FE WebUI | <http://localhost:38030>（root / 空密码） |
 
 ---
 
-## 📦 系统架构
+## 系统架构
 
-```
-┌─────────────────┐
-│  前端 (Vue 3)   │  ← http://localhost:5173
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  API Gateway    │  ← http://localhost:8018
-│  (FastAPI)      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  Apache Doris 4.0 Cluster   │
-│  ┌──────┐      ┌──────┐     │
-│  │  FE  │◄────►│  BE  │     │
-│  └──────┘      └──────┘     │
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Vanna.AI       │  ← Text-to-SQL
-│  (DeepSeek)     │
-└─────────────────┘
+```text
+前端 (Vue 3)          http://localhost:35173
+      │
+      ▼
+API Gateway           http://localhost:38018
+(FastAPI + Vanna.AI)
+      │  PlannerAgent    → 多表路由 + 意图识别
+      │  TableAdminAgent → 单表 SQL 生成
+      │  CoordinatorAgent→ 多表 JOIN 合并
+      │  RepairAgent     → SQL 失败自动修复
+      ▼
+Apache Doris 4.0
+  FE (38030) ◄──► BE (38040)
+      │
+      ▼
+LLM (DeepSeek / OpenAI-compatible)
 ```
 
 ---
 
-## 🎯 核心功能
+## 功能
 
-### 1. Excel 数据上传
-- 拖拽上传 Excel 文件
-- 自动创建表结构
-- 批量导入数据
-
-### 2. AI 自然语言查询
-- 输入中文问题,自动生成 SQL
-- 支持复杂统计分析
-- 实时返回查询结果
-
-### 3. LLM 配置管理
-- 支持多种 AI 提供商 (OpenAI, DeepSeek, Gemini 等)
-- 灵活配置 API Key 和模型
-- 动态切换 AI 资源
-
-### 4. 数据查询
-- 可视化表结构浏览
-- SQL 查询执行
-- 结果导出
+| 功能 | 说明 |
+| ---- | ---- |
+| Excel 上传 | 自动建表 + Stream Load 批量导入，支持 replace / append 模式 |
+| 自然语言查询 | Planner 多表路由 → TableAdmin 生成 SQL → 执行 → 结果返回 |
+| 多表 JOIN | CoordinatorAgent 根据表关系自动生成跨表 JOIN SQL |
+| SQL 自动修复 | RepairAgent：执行失败时 LLM 自动修复，最多重试 2 次 |
+| 查询记忆（RAG） | 成功 Q→SQL 自动存档，下次查询 Few-shot 注入 |
+| 元数据分析 | 上传后 LLM 自动分析表结构和列语义，生成业务描述 |
+| 模糊地名匹配 | 自动将地理字段精确匹配转为 LIKE，提升查询成功率 |
+| LLM 配置管理 | 支持 OpenAI / DeepSeek / 通义等多提供商，存储于 Doris Resources |
+| 数据源同步 | 从外部数据库同步表到 Doris（APScheduler 定时任务） |
+| 统一执行接口 | query / sentiment / classify / extract 等 AI 操作 |
+| API 认证 | `SMATRIX_API_KEY` 中间件，支持 `X-API-Key` 和 `Bearer` |
+| MCP Server | stdio wrapper，支持外部 AI Agent 通过 MCP 协议接入 |
+| Docker 部署 | 4 服务一键启动（Frontend + Backend + Doris FE/BE） |
 
 ---
 
-## 🔧 配置说明
+## 配置说明
 
-### 环境变量
+复制 `.env.example` 为 `.env` 后编辑：
 
-所有配置都在 `docker-compose.yml` 中:
+```bash
+# LLM 配置（必填其一）
+DEEPSEEK_API_KEY=sk-your-key-here    # 从 platform.deepseek.com 获取
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com
 
-```yaml
-environment:
-  # Doris 数据库配置
-  - DORIS_HOST=doris-fe
-  - DORIS_PORT=9030
-  - DORIS_DATABASE=doris_db        # 数据库名称
-  
-  # DeepSeek API 配置 (可选)
-  - DEEPSEEK_API_KEY=sk-your-key   # 替换为你的 API Key
-  - DEEPSEEK_MODEL=deepseek-chat
-  - DEEPSEEK_BASE_URL=https://api.deepseek.com
+# API 认证密钥（必填）
+# 所有 /api/* 接口请求都需要在 Header 中携带此 Key
+# X-API-Key: <your-key>  或  Authorization: Bearer <your-key>
+SMATRIX_API_KEY=your-secret-api-key-here
+
+# CORS 允许的前端地址（多个用逗号分隔）
+SMATRIX_CORS_ORIGINS=http://localhost:35173
 ```
 
-### 网络配置
+> `docker-compose.yml` 会自动读取 `.env` 中的变量，无需手动修改 compose 文件。
 
-如果遇到网络冲突错误:
-```
-Error: Pool overlaps with other one on this address space
-```
+### 网络冲突处理
 
-修改 `docker-compose.yml` 中的网络段:
+如遇 `Pool overlaps with other one on this address space`，修改 `docker-compose.yml` 中的网络段：
 
 ```yaml
 networks:
-  doris-network:
+  smatrix-network:
     ipam:
       config:
-        - subnet: 192.168.88.0/24    # 改成其他未占用的网段
-          gateway: 192.168.88.1
+        - subnet: 192.168.200.0/24   # 改为未占用的网段
 ```
 
-同时修改对应的 IP 地址:
-- `FE_SERVERS=fe1:192.168.88.2:9010`
-- `BE_ADDR=192.168.88.3:9050`
-- `ipv4_address: 192.168.88.2` 和 `192.168.88.3`
+同步修改各服务的 `ipv4_address` 和 `FE_SERVERS` / `BE_ADDR` 环境变量。
 
 ---
 
-## 📊 使用示例
-
-### 1. 上传 Excel 数据
-
-1. 打开前端界面 http://localhost:5173
-2. 点击 "Excel 上传"
-3. 拖拽或选择 Excel 文件
-4. 输入表名,点击上传
-
-### 2. AI 自然语言查询
-
-1. 点击 "AI 问答"
-2. 输入问题,例如:
-   - "2022年的机构中来自于广东的有多少个?"
-   - "每个城市的机构数量占比是多少?"
-3. 点击 "执行查询"
-4. 查看生成的 SQL 和结果
-
-### 3. 配置 AI 资源
-
-1. 点击 "LLM 配置"
-2. 填写配置信息:
-   - 资源名称: `my_deepseek`
-   - 提供商: `deepseek`
-   - API Key: `sk-your-key`
-   - 模型: `deepseek-chat`
-3. 点击 "创建资源"
-
----
-
-## 🛠️ 常用命令
+## 常用命令
 
 ```bash
-# 查看所有容器状态
+# 查看状态
 docker-compose ps
 
 # 查看日志
-docker-compose logs -f
+docker-compose logs -f smatrix-api
 
-# 重启服务
-docker-compose restart
+# 重启 API 服务
+docker-compose restart smatrix-api
 
-# 停止服务
+# 停止
 docker-compose down
 
-# 完全清理 (包括数据卷)
+# 完全清理（含数据卷）
 docker-compose down -v
 
-# 重新构建并启动
+# 重新构建
 docker-compose up -d --build
 ```
 
 ---
 
-## 🔍 故障排查
+## API 认证
 
-### 问题 1: BE 节点不健康
+所有 `/api/*` 接口（除 `/api/health`）需要提供认证 Key，二选一：
 
-**症状**: `dependency failed to start: container doris-be is unhealthy`
-
-**解决**:
 ```bash
-# 查看 BE 日志
-docker logs doris-be
+# 方式 1：X-API-Key Header
+curl -H "X-API-Key: your-secret-api-key" http://localhost:38018/api/tables
 
-# 手动注册 BE 节点
-docker exec -it doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND '192.168.88.3:9050';"
+# 方式 2：Bearer Token
+curl -H "Authorization: Bearer your-secret-api-key" http://localhost:38018/api/tables
 ```
 
-### 问题 2: 数据库不存在
+---
 
-**症状**: `Unknown database 'doris_db'`
+## 故障排查
 
-**解决**: API 会在启动时自动创建数据库,如果失败,手动创建:
+### BE 节点不健康
+
 ```bash
-docker exec -it doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "CREATE DATABASE IF NOT EXISTS doris_db;"
+docker logs smatrix-be
+
+# 手动注册 BE
+docker exec -it smatrix-fe mysql -h127.0.0.1 -P9030 -uroot \
+  -e "ALTER SYSTEM ADD BACKEND '192.168.100.3:9050';"
 ```
 
-### 问题 3: 网络冲突
+### 数据库不存在
 
-**症状**: `Pool overlaps with other one on this address space`
+API 启动时会自动创建，手动创建：
 
-**解决**: 参考上面的 "网络配置" 部分修改网络段。
+```bash
+docker exec -it smatrix-fe mysql -h127.0.0.1 -P9030 -uroot \
+  -e "CREATE DATABASE IF NOT EXISTS doris_db;"
+```
 
----
+### API Key 失效（401 错误）
 
-## 📝 技术栈
+更新 `.env` 中的 `DEEPSEEK_API_KEY`，然后：
 
-- **前端**: Vue 3.5 + TypeScript + Vite + Ant Design Vue
-- **后端**: Python 3.11 + FastAPI + Uvicorn
-- **数据库**: Apache Doris 4.0 (1 FE + 1 BE)
-- **AI**: Vanna.AI + DeepSeek / OpenAI
-- **部署**: Docker + Docker Compose
+```bash
+docker-compose up -d smatrix-api
+```
 
----
+### 启动后返回 503
 
-## 📄 许可证
-
-MIT License
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request!
+Doris 初始化需要 2-3 分钟，503 表示 FE/BE 尚未就绪，稍等后重试即可。
 
 ---
 
-## 📧 联系方式
+## 技术栈
 
-- GitHub: https://github.com/sga-jerrylin/doris-sga
-- Email: jerrylin@sologenai.com
+- **前端**：Vue 3.5 + TypeScript + Vite 7 + Ant Design Vue 4
+- **后端**：Python 3.11 + FastAPI 0.115 + Uvicorn
+- **数据库**：Apache Doris 4.0（1 FE + 1 BE）
+- **AI**：Vanna.AI 0.7.9 + DeepSeek / OpenAI-compatible
+- **部署**：Docker Compose
 
+---
+
+## 项目文档
+
+| 文档 | 说明 |
+| ---- | ---- |
+| [API_EXAMPLES.md](./API_EXAMPLES.md) | HTTP API 调用示例（含认证） |
+| [.plans/task_plan.md](.plans/task_plan.md) | 架构设计 + 任务清单 + 验证命令 |
+| [.plans/findings.md](.plans/findings.md) | 代码库分析结论 + 踩坑记录 |
+| [.plans/progress.md](.plans/progress.md) | 实现进度记录 |
+
+---
+
+## 联系方式
+
+- GitHub: <https://github.com/sga-jerrylin/S-Matrix>
+- Email: <jerrylin@sologenai.com>

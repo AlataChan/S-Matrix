@@ -1,31 +1,38 @@
-# Doris API Gateway - HTTP 调用范例
+# S-Matrix API 调用示例
 
-本文档提供外部 Agent 通过 HTTP 访问 Doris 数据中台的完整示例。
+本文档提供通过 HTTP 访问 S-Matrix 数据中台的完整示例。
 
-**API 基础地址**: `http://localhost:8018`
+**API 基础地址**: `http://localhost:38018`
+
+> **认证说明**：所有 `/api/*` 接口（除 `/api/health`）都需要在 Header 中携带 `SMATRIX_API_KEY`。
+> 两种方式任选其一：`X-API-Key: <key>` 或 `Authorization: Bearer <key>`
 
 ---
 
-## 📋 目录
+## 目录
 
 1. [健康检查](#1-健康检查)
-2. [自然语言查询 (AI Agent)](#2-自然语言查询-ai-agent)
+2. [自然语言查询](#2-自然语言查询)
 3. [Excel 数据上传](#3-excel-数据上传)
 4. [数据查询](#4-数据查询)
 5. [表管理](#5-表管理)
 6. [LLM 配置管理](#6-llm-配置管理)
+7. [查询历史与反馈](#7-查询历史与反馈)
+8. [表关系管理](#8-表关系管理)
+9. [完整 Agent 调用示例](#9-完整-agent-调用示例)
 
 ---
 
 ## 1. 健康检查
 
-### 1.1 基础健康检查
+### 1.1 基础健康检查（无需认证）
 
 ```bash
-curl http://localhost:8018/
+curl http://localhost:38018/
 ```
 
 **响应:**
+
 ```json
 {
   "service": "Doris API Gateway",
@@ -34,93 +41,82 @@ curl http://localhost:8018/
 }
 ```
 
-### 1.2 Doris 连接检查
+### 1.2 Doris 连接检查（无需认证）
 
 ```bash
-curl http://localhost:8018/api/health
+curl http://localhost:38018/api/health
 ```
 
 **响应:**
+
 ```json
 {
   "success": true,
-  "doris_connected": true
+  "doris_connected": true,
+  "message": "Doris connection OK"
 }
 ```
 
 ---
 
-## 2. 自然语言查询 (AI Agent)
+## 2. 自然语言查询
 
-**这是最核心的 Agent-to-Agent 接口!**
+**核心接口**：多 Agent 流水线（Planner → TableAdmin → Coordinator → RepairAgent）
 
-### 2.1 使用默认 API Key (环境变量配置)
+### 2.1 基本查询
 
 ```bash
-curl -X POST http://localhost:8018/api/query/natural \
+curl -X POST http://localhost:38018/api/query/natural \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
   -d '{
     "query": "2022年的机构中来自于广东的有多少个?"
   }'
 ```
 
-### 2.2 使用自定义 API Key
+### 2.2 指定目标表（缩小查询范围）
 
 ```bash
-curl -X POST http://localhost:8018/api/query/natural \
+curl -X POST http://localhost:38018/api/query/natural \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
   -d '{
     "query": "每个城市的机构数量占比是多少?",
-    "api_key": "sk-your-deepseek-api-key",
-    "model": "deepseek-chat",
-    "base_url": "https://api.deepseek.com"
+    "table_names": ["institutions_2022"]
   }'
 ```
 
-### 2.3 Python 示例
+### 2.3 指定 LLM 资源
+
+```bash
+curl -X POST http://localhost:38018/api/query/natural \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
+  -d '{
+    "query": "统计每个省份的机构数量",
+    "resource_name": "my_deepseek"
+  }'
+```
+
+### 2.4 Python 示例
 
 ```python
 import requests
 
-url = "http://localhost:8018/api/query/natural"
+API_KEY = "your-secret-api-key"
+BASE_URL = "http://localhost:38018"
+HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
-# 方式 1: 使用默认配置
-response = requests.post(url, json={
-    "query": "统计每个省份的机构数量"
-})
-
-# 方式 2: 使用自定义 API Key
-response = requests.post(url, json={
-    "query": "统计每个省份的机构数量",
-    "api_key": "sk-your-deepseek-api-key",
-    "model": "deepseek-chat"
-})
+response = requests.post(
+    f"{BASE_URL}/api/query/natural",
+    headers=HEADERS,
+    json={"query": "统计每个省份的机构数量"}
+)
 
 result = response.json()
 print(f"生成的 SQL: {result['sql']}")
 print(f"查询结果: {result['data']}")
 print(f"记录数: {result['count']}")
-```
-
-### 2.4 JavaScript 示例
-
-```javascript
-// 使用 fetch API
-const response = await fetch('http://localhost:8018/api/query/natural', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  body: JSON.stringify({
-    query: '2022年的机构中来自于广东的有多少个?',
-    api_key: 'sk-your-deepseek-api-key'  // 可选
-  })
-});
-
-const result = await response.json();
-console.log('生成的 SQL:', result.sql);
-console.log('查询结果:', result.data);
-console.log('记录数:', result.count);
 ```
 
 ### 2.5 响应示例
@@ -129,12 +125,8 @@ console.log('记录数:', result.count);
 {
   "success": true,
   "query": "2022年的机构中来自于广东的有多少个?",
-  "sql": "SELECT COUNT(*) as count FROM institutions WHERE year = 2022 AND province = '广东'",
-  "data": [
-    {
-      "count": 156
-    }
-  ],
+  "sql": "SELECT COUNT(*) as count FROM institutions WHERE year = 2022 AND province LIKE '%广东%'",
+  "data": [{"count": 156}],
   "count": 1
 }
 ```
@@ -146,7 +138,8 @@ console.log('记录数:', result.count);
 ### 3.1 预览 Excel 文件
 
 ```bash
-curl -X POST http://localhost:8018/api/upload/preview \
+curl -X POST http://localhost:38018/api/upload/preview \
+  -H "X-API-Key: your-secret-api-key" \
   -F "file=@/path/to/your/data.xlsx" \
   -F "rows=10"
 ```
@@ -154,63 +147,58 @@ curl -X POST http://localhost:8018/api/upload/preview \
 ### 3.2 上传并创建表
 
 ```bash
-curl -X POST http://localhost:8018/api/upload \
+curl -X POST http://localhost:38018/api/upload \
+  -H "X-API-Key: your-secret-api-key" \
   -F "file=@/path/to/your/data.xlsx" \
   -F "table_name=my_table" \
-  -F "create_table=true"
+  -F "create_table=true" \
+  -F "import_mode=replace"
 ```
+
+`import_mode` 支持两种值：
+
+- `replace`：覆盖同名表（重新上传修正版时使用）
+- `append`：追加到现有表（列名和顺序必须完全一致）
+
+上传完成后会自动触发 LLM 元数据分析，生成表的业务语义描述。
 
 ### 3.3 Python 示例
 
 ```python
 import requests
 
-url = "http://localhost:8018/api/upload"
+API_KEY = "your-secret-api-key"
+HEADERS = {"X-API-Key": API_KEY}
 
-# 上传 Excel 文件
 with open('data.xlsx', 'rb') as f:
     files = {'file': ('data.xlsx', f, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}
     data = {
         'table_name': 'institutions',
-        'create_table': 'true'
+        'create_table': 'true',
+        'import_mode': 'replace'
     }
-    response = requests.post(url, files=files, data=data)
+    response = requests.post(
+        "http://localhost:38018/api/upload",
+        headers=HEADERS,
+        files=files,
+        data=data
+    )
 
 result = response.json()
 print(f"上传成功: {result['success']}")
-print(f"表名: {result['table_name']}")
 print(f"导入行数: {result['rows_imported']}")
 ```
 
-### 3.4 JavaScript 示例 (Node.js)
-
-```javascript
-const FormData = require('form-data');
-const fs = require('fs');
-
-const form = new FormData();
-form.append('file', fs.createReadStream('data.xlsx'));
-form.append('table_name', 'institutions');
-form.append('create_table', 'true');
-
-const response = await fetch('http://localhost:8018/api/upload', {
-  method: 'POST',
-  body: form
-});
-
-const result = await response.json();
-console.log('上传结果:', result);
-```
-
-### 3.5 响应示例
+### 3.4 响应示例
 
 ```json
 {
   "success": true,
-  "message": "数据上传成功",
-  "table_name": "institutions",
+  "table": "institutions",
   "rows_imported": 1500,
-  "columns": ["id", "name", "province", "city", "year"]
+  "table_existed": false,
+  "table_created": true,
+  "import_mode": "replace"
 }
 ```
 
@@ -221,8 +209,9 @@ console.log('上传结果:', result);
 ### 4.1 执行 SQL 查询
 
 ```bash
-curl -X POST http://localhost:8018/api/execute \
+curl -X POST http://localhost:38018/api/execute \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
   -d '{
     "action": "query",
     "params": {
@@ -231,38 +220,28 @@ curl -X POST http://localhost:8018/api/execute \
   }'
 ```
 
-### 4.2 Python 示例
+### 4.2 支持的 action 类型
 
-```python
-import requests
+| action | 说明 |
+| ------ | ---- |
+| `query` | 普通 SQL 查询 |
+| `sentiment` | 情感分析 |
+| `classify` | 文本分类 |
+| `extract` | 信息提取 |
+| `stats` | 统计分析 |
+| `similarity` | 语义相似度 |
+| `translate` | 文本翻译 |
+| `summarize` | 文本摘要 |
+| `mask` | 敏感信息脱敏 |
+| `fixgrammar` | 语法纠错 |
+| `generate` | 内容生成 |
+| `filter` | 布尔过滤 |
 
-url = "http://localhost:8018/api/execute"
+### 4.3 获取查询目录（业务语义视图）
 
-# 执行查询
-response = requests.post(url, json={
-    "action": "query",
-    "params": {
-        "sql": "SELECT province, COUNT(*) as count FROM institutions GROUP BY province"
-    }
-})
-
-result = response.json()
-print(result['data'])
-```
-
-### 4.3 响应示例
-
-```json
-{
-  "success": true,
-  "action": "query",
-  "data": [
-    {"province": "广东", "count": 156},
-    {"province": "北京", "count": 89},
-    {"province": "上海", "count": 72}
-  ],
-  "count": 3
-}
+```bash
+curl -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/query/catalog
 ```
 
 ---
@@ -272,51 +251,38 @@ print(result['data'])
 ### 5.1 获取所有表
 
 ```bash
-curl http://localhost:8018/api/tables
-```
-
-**Python:**
-```python
-response = requests.get("http://localhost:8018/api/tables")
-tables = response.json()['tables']
-print(tables)
-```
-
-**响应:**
-```json
-{
-  "success": true,
-  "tables": ["institutions", "customers", "orders"]
-}
+curl -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/tables
 ```
 
 ### 5.2 获取表结构
 
 ```bash
-curl http://localhost:8018/api/tables/institutions/schema
+curl -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/tables/institutions/schema
 ```
 
-**Python:**
-```python
-response = requests.get("http://localhost:8018/api/tables/institutions/schema")
-schema = response.json()['schema']
-for col in schema:
-    print(f"{col['Field']}: {col['Type']}")
+### 5.3 获取表注册表（含元数据）
+
+```bash
+curl -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/table-registry
 ```
 
-**响应:**
-```json
-{
-  "success": true,
-  "table": "institutions",
-  "schema": [
-    {"Field": "id", "Type": "INT", "Null": "NO", "Key": "PRI"},
-    {"Field": "name", "Type": "VARCHAR(255)", "Null": "YES", "Key": ""},
-    {"Field": "province", "Type": "VARCHAR(50)", "Null": "YES", "Key": ""},
-    {"Field": "city", "Type": "VARCHAR(50)", "Null": "YES", "Key": ""}
-  ]
-}
+### 5.4 删除表（含完整清理）
+
+```bash
+curl -X DELETE \
+  -H "X-API-Key: your-secret-api-key" \
+  "http://localhost:38018/api/table-registry/my_table?drop_physical=true&cleanup_history=true"
 ```
+
+该接口会：
+
+- 删除 Doris 物理表
+- 删除 `_sys_table_registry` 中的记录
+- 删除表元数据、Agent 配置、字段目录、表关系
+- （可选）清理与该表相关的历史问答样本
 
 ---
 
@@ -325,8 +291,9 @@ for col in schema:
 ### 6.1 创建 LLM 配置
 
 ```bash
-curl -X POST http://localhost:8018/api/llm/config \
+curl -X POST http://localhost:38018/api/llm/config \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
   -d '{
     "resource_name": "my_deepseek",
     "provider_type": "deepseek",
@@ -339,85 +306,147 @@ curl -X POST http://localhost:8018/api/llm/config \
 ### 6.2 获取所有 LLM 配置
 
 ```bash
-curl http://localhost:8018/api/llm/config
+curl -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/llm/config
 ```
 
 ### 6.3 测试 LLM 配置
 
 ```bash
-curl -X POST http://localhost:8018/api/llm/config/my_deepseek/test
+curl -X POST \
+  -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/llm/config/my_deepseek/test
 ```
 
 ### 6.4 删除 LLM 配置
 
 ```bash
-curl -X DELETE http://localhost:8018/api/llm/config/my_deepseek
+curl -X DELETE \
+  -H "X-API-Key: your-secret-api-key" \
+  http://localhost:38018/api/llm/config/my_deepseek
 ```
 
 ---
 
-## 🚀 完整 Agent 调用示例
+## 7. 查询历史与反馈
 
-### Python Agent 示例
+### 7.1 获取查询历史
+
+```bash
+curl -H "X-API-Key: your-secret-api-key" \
+  "http://localhost:38018/api/query/history?limit=50"
+```
+
+### 7.2 标记查询质量（用于 RAG 训练）
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
+  -d '{"quality_gate": 1}' \
+  http://localhost:38018/api/query/history/<query_id>/feedback
+```
+
+`quality_gate` 值：`1` = 好，`-1` = 差，`0` = 未标记
+
+---
+
+## 8. 表关系管理
+
+跨表 JOIN 查询需要预先定义表之间的关联关系。
+
+### 8.1 创建表关系
+
+```bash
+curl -X POST http://localhost:38018/api/relationships \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
+  -d '{
+    "table_a": "orders",
+    "column_a": "customer_id",
+    "table_b": "customers",
+    "column_b": "id"
+  }'
+```
+
+创建后，当问题涉及两张表时，CoordinatorAgent 会自动生成 JOIN SQL。
+
+---
+
+## 9. 完整 Agent 调用示例
 
 ```python
 import requests
 
-class DorisAgent:
-    def __init__(self, base_url="http://localhost:8018", api_key=None):
-        self.base_url = base_url
-        self.api_key = api_key
-    
-    def ask(self, question: str):
-        """使用自然语言提问"""
-        url = f"{self.base_url}/api/query/natural"
+class SMatrixClient:
+    def __init__(self, base_url="http://localhost:38018", api_key=None):
+        self.base_url = base_url.rstrip("/")
+        self.headers = {
+            "X-API-Key": api_key or "",
+            "Content-Type": "application/json"
+        }
+
+    def ask(self, question: str, table_names: list = None, resource_name: str = None):
+        """自然语言查询（多 Agent 流水线）"""
         payload = {"query": question}
-        if self.api_key:
-            payload["api_key"] = self.api_key
-        
-        response = requests.post(url, json=payload)
+        if table_names:
+            payload["table_names"] = table_names
+        if resource_name:
+            payload["resource_name"] = resource_name
+        response = requests.post(
+            f"{self.base_url}/api/query/natural",
+            headers=self.headers,
+            json=payload
+        )
+        response.raise_for_status()
         return response.json()
-    
-    def upload_data(self, file_path: str, table_name: str):
+
+    def upload(self, file_path: str, table_name: str, mode: str = "replace"):
         """上传 Excel 数据"""
-        url = f"{self.base_url}/api/upload"
+        headers = {"X-API-Key": self.headers["X-API-Key"]}
         with open(file_path, 'rb') as f:
-            files = {'file': f}
-            data = {'table_name': table_name, 'create_table': 'true'}
-            response = requests.post(url, files=files, data=data)
+            response = requests.post(
+                f"{self.base_url}/api/upload",
+                headers=headers,
+                files={'file': f},
+                data={'table_name': table_name, 'create_table': 'true', 'import_mode': mode}
+            )
+        response.raise_for_status()
         return response.json()
-    
-    def query(self, sql: str):
-        """执行 SQL 查询"""
-        url = f"{self.base_url}/api/execute"
-        response = requests.post(url, json={
-            "action": "query",
-            "params": {"sql": sql}
-        })
+
+    def query_sql(self, sql: str):
+        """直接执行 SQL"""
+        response = requests.post(
+            f"{self.base_url}/api/execute",
+            headers=self.headers,
+            json={"action": "query", "params": {"sql": sql}}
+        )
+        response.raise_for_status()
         return response.json()
+
 
 # 使用示例
-agent = DorisAgent(api_key="sk-your-deepseek-api-key")
+client = SMatrixClient(api_key="your-secret-api-key")
 
 # 1. 上传数据
-result = agent.upload_data("institutions.xlsx", "institutions")
+result = client.upload("institutions.xlsx", "institutions")
 print(f"上传成功: {result['rows_imported']} 行")
 
-# 2. 自然语言查询
-result = agent.ask("2022年广东省有多少个机构?")
+# 2. 自然语言查询（自动多表路由 + SQL 修复）
+result = client.ask("2022年广东省有多少个机构？")
 print(f"SQL: {result['sql']}")
 print(f"结果: {result['data']}")
 
 # 3. 直接 SQL 查询
-result = agent.query("SELECT * FROM institutions LIMIT 5")
+result = client.query_sql("SELECT * FROM institutions LIMIT 5")
 print(f"查询结果: {result['data']}")
 ```
 
 ---
 
-## 📝 错误处理
+## 错误处理
 
-所有 API 在出错时返回标准错误格式:
+所有 API 在出错时返回标准错误格式：
 
 ```json
 {
@@ -428,34 +457,20 @@ print(f"查询结果: {result['data']}")
 }
 ```
 
-**Python 错误处理示例:**
+**常见状态码**：
 
-```python
-try:
-    response = requests.post(url, json=payload)
-    response.raise_for_status()
-    result = response.json()
-except requests.exceptions.HTTPError as e:
-    error_detail = e.response.json().get('detail', {})
-    print(f"错误: {error_detail.get('error', str(e))}")
-```
+| 状态码 | 含义 |
+| ------ | ---- |
+| 401 | API Key 错误或未提供 |
+| 503 | Doris 尚未就绪（启动中），等待后重试 |
+| 400 | 请求参数错误 |
+| 500 | 服务内部错误（查看 traceback） |
 
 ---
 
-## 🔐 认证 (可选)
+## API 文档
 
-当前版本不需要认证。如果需要添加认证,可以在请求头中添加:
+完整的交互式 API 文档（需要先通过认证）：
 
-```bash
-curl -H "Authorization: Bearer your-token" \
-  http://localhost:8018/api/query/natural
-```
-
----
-
-## 📖 API 文档
-
-完整的交互式 API 文档:
-- **Swagger UI**: http://localhost:8018/docs
-- **ReDoc**: http://localhost:8018/redoc
-
+- **Swagger UI**: <http://localhost:38018/docs>
+- **ReDoc**: <http://localhost:38018/redoc>
