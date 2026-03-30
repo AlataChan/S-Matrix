@@ -20,10 +20,10 @@
 git clone https://github.com/sga-jerrylin/S-Matrix.git
 cd S-Matrix
 
-# 复制环境变量配置文件
-cp .env.example .env
+# 初始化 .env（自动生成 SMATRIX_API_KEY 和 ENCRYPTION_KEY）
+bash scripts/setup_env.sh
 
-# 编辑 .env，填入必填项（见下方配置说明）
+# 填入 LLM API Key（脚本会提示哪些字段需要手动填写）
 vim .env
 
 docker-compose up -d
