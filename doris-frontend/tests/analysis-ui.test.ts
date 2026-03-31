@@ -19,3 +19,15 @@ test('analysis UI exposes expert mode and reasoning affordances', () => {
   assert.match(component, /conversation/i);
   assert.match(component, /2-5 分钟|2-5 minutes/i);
 });
+
+test('analysis UI renders fixed expert business layout', () => {
+  const component = readFileSync(new URL('../src/components/DataAnalysis.vue', import.meta.url), 'utf8');
+
+  assert.match(component, /经营摘要/);
+  assert.match(component, /关键洞察/);
+  assert.match(component, /动作建议/);
+  assert.match(component, /详细分析/);
+  assert.match(component, /expertExecutiveSummary/);
+  assert.match(component, /expertTopInsights/);
+  assert.match(component, /expertActionItems/);
+});

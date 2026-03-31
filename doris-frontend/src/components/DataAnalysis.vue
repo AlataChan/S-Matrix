@@ -70,7 +70,7 @@
                     </a-space>
                   </template>
 
-                  <div class="report-summary">{{ item.summary || '暂无摘要' }}</div>
+                  <div class="report-summary">{{ readableSummary(item) }}</div>
                   <a-space wrap class="report-metrics">
                     <a-tag color="processing">洞察 {{ item.insight_count || 0 }}</a-tag>
                     <a-tag color="warning">异常 {{ item.anomaly_count || 0 }}</a-tag>
@@ -143,7 +143,6 @@
                 <a-tag :color="statusColor(analysisResult.status)">{{ analysisResult.status || 'completed' }}</a-tag>
               </a-space>
             </template>
-            <p class="report-summary">{{ analysisResult.summary || '暂无摘要' }}</p>
             <a-space
               v-if="analysisResult.depth === 'expert'"
               wrap
@@ -155,81 +154,116 @@
               </a-tag>
               <a-tag color="blue">Expert</a-tag>
             </a-space>
+            <template v-if="isExpertReport(analysisResult)">
+              <a-divider orientation="left">经营摘要</a-divider>
+              <div class="business-summary-card">{{ expertExecutiveSummary(analysisResult) }}</div>
 
-            <a-divider orientation="left">洞察</a-divider>
-            <a-empty v-if="!(analysisResult.insights || []).length" description="暂无洞察" />
-            <a-list v-else :data-source="analysisResult.insights" size="small">
-              <template #renderItem="{ item }">
-                <a-list-item>
-                  <a-space direction="vertical" size="small">
-                    <strong>{{ item.title }}</strong>
-                    <span>{{ item.detail }}</span>
-                  </a-space>
-                </a-list-item>
-              </template>
-            </a-list>
-
-            <template v-if="analysisResult.depth === 'expert'">
-              <a-divider orientation="left">Root Causes</a-divider>
-              <a-empty v-if="!(analysisResult.root_causes || []).length" description="暂无根因分析" />
-              <a-list v-else :data-source="analysisResult.root_causes" size="small" bordered />
-
-              <a-divider orientation="left">Evidence Chains</a-divider>
-              <a-empty v-if="!(analysisResult.evidence_chains || []).length" description="暂无证据链" />
-              <a-list v-else :data-source="analysisResult.evidence_chains" size="small">
+              <a-divider orientation="left">关键洞察</a-divider>
+              <a-empty v-if="!expertTopInsights(analysisResult).length" description="暂无关键洞察" />
+              <a-list v-else :data-source="expertTopInsights(analysisResult)" size="small">
                 <template #renderItem="{ item }">
                   <a-list-item>
-                    <div class="evidence-card">
-                      <strong>{{ item.finding || 'Finding' }}</strong>
-                      <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
-                      <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
-                      <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
-                    </div>
+                    <a-space direction="vertical" size="small">
+                      <strong>{{ displayInsightTitle(item) }}</strong>
+                      <span>{{ displayInsightDetail(item) }}</span>
+                    </a-space>
                   </a-list-item>
                 </template>
               </a-list>
 
-              <a-divider orientation="left">Conversation Timeline</a-divider>
-              <a-empty v-if="!(analysisResult.conversation_chain || []).length" description="暂无 conversation" />
-              <a-collapse v-else>
-                <a-collapse-panel
-                  v-for="(round, index) in analysisResult.conversation_chain || []"
-                  :key="round.round || index"
-                  :header="`Round ${round.round || index + 1}`"
-                >
-                  <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
-                  <div class="round-result-list" v-if="(round.results || []).length">
-                    <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
-                      <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
-                      <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
-                      <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
-                      <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
-                    </div>
-                  </div>
-                </a-collapse-panel>
-              </a-collapse>
+              <a-divider orientation="left">动作建议</a-divider>
+              <a-empty v-if="!expertActionItems(analysisResult).length" description="暂无动作建议" />
+              <a-list v-else :data-source="expertActionItems(analysisResult)" size="small">
+                <template #renderItem="{ item }">
+                  <a-list-item>
+                    <a-space direction="vertical" size="small">
+                      <strong>{{ displayInsightTitle(item) }}</strong>
+                      <span>{{ displayInsightDetail(item) }}</span>
+                    </a-space>
+                  </a-list-item>
+                </template>
+              </a-list>
 
-              <a-divider orientation="left">Reasoning Trace</a-divider>
-              <a-empty v-if="!(analysisResult.reasoning_traces || []).length" description="暂无 reasoning" />
-              <a-collapse v-else ghost>
-                <a-collapse-panel
-                  v-for="(trace, index) in analysisResult.reasoning_traces || []"
-                  :key="trace.round || index"
-                  :header="`Round ${trace.round || index + 1}`"
-                >
-                  <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
+              <a-collapse ghost class="expert-detail-collapse">
+                <a-collapse-panel key="analysis-result-detail" header="详细分析">
+                  <a-divider orientation="left">根因分析</a-divider>
+                  <a-empty v-if="!(analysisResult.root_causes || []).length" description="暂无根因分析" />
+                  <a-list v-else :data-source="analysisResult.root_causes" size="small" bordered />
+
+                  <a-divider orientation="left">证据链</a-divider>
+                  <a-empty v-if="!(analysisResult.evidence_chains || []).length" description="暂无证据链" />
+                  <a-list v-else :data-source="analysisResult.evidence_chains" size="small">
+                    <template #renderItem="{ item }">
+                      <a-list-item>
+                        <div class="evidence-card">
+                          <strong>{{ displayFindingTitle(item.finding) }}</strong>
+                          <div class="inline-metric" v-if="displayFindingDetail(item)">{{ displayFindingDetail(item) }}</div>
+                          <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
+                          <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
+                          <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
+                        </div>
+                      </a-list-item>
+                    </template>
+                  </a-list>
+
+                  <a-divider orientation="left">分析过程</a-divider>
+                  <a-empty v-if="!(analysisResult.conversation_chain || []).length" description="暂无分析过程" />
+                  <a-collapse v-else>
+                    <a-collapse-panel
+                      v-for="(round, index) in analysisResult.conversation_chain || []"
+                      :key="round.round || index"
+                      :header="`Round ${round.round || index + 1}`"
+                    >
+                      <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
+                      <div class="round-result-list" v-if="(round.results || []).length">
+                        <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
+                          <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
+                          <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
+                          <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
+                          <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
+                        </div>
+                      </div>
+                    </a-collapse-panel>
+                  </a-collapse>
+
+                  <a-divider orientation="left">推理轨迹</a-divider>
+                  <a-empty v-if="!(analysisResult.reasoning_traces || []).length" description="暂无推理轨迹" />
+                  <a-collapse v-else ghost>
+                    <a-collapse-panel
+                      v-for="(trace, index) in analysisResult.reasoning_traces || []"
+                      :key="trace.round || index"
+                      :header="`Round ${trace.round || index + 1}`"
+                    >
+                      <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
+                    </a-collapse-panel>
+                  </a-collapse>
+
+                  <a-divider orientation="left">限制说明</a-divider>
+                  <a-empty v-if="!(analysisResult.limitations || []).length" description="暂无限制说明" />
+                  <a-list v-else :data-source="analysisResult.limitations" size="small" bordered />
                 </a-collapse-panel>
               </a-collapse>
             </template>
 
-            <a-divider orientation="left">建议</a-divider>
-            <a-empty v-if="!(analysisResult.recommendations || []).length" description="暂无建议" />
-            <a-list v-else :data-source="analysisResult.recommendations" size="small" bordered />
+            <template v-else>
+              <p class="report-summary">{{ readableSummary(analysisResult) }}</p>
 
-            <template v-if="analysisResult.depth === 'expert'">
-              <a-divider orientation="left">Limitations</a-divider>
-              <a-empty v-if="!(analysisResult.limitations || []).length" description="暂无限制说明" />
-              <a-list v-else :data-source="analysisResult.limitations" size="small" bordered />
+              <a-divider orientation="left">洞察</a-divider>
+              <a-empty v-if="!(analysisResult.insights || []).length" description="暂无洞察" />
+              <a-list v-else :data-source="analysisResult.insights" size="small">
+                  <template #renderItem="{ item }">
+                    <a-list-item>
+                      <a-space direction="vertical" size="small">
+                        <strong>{{ displayInsightTitle(item) }}</strong>
+                        <span>{{ displayInsightDetail(item) }}</span>
+                      </a-space>
+                    </a-list-item>
+                  </template>
+                </a-list>
+
+              <a-divider orientation="left">建议</a-divider>
+              <a-empty v-if="!(analysisResult.recommendations || []).length" description="暂无建议" />
+              <a-list v-else :data-source="analysisResult.recommendations" size="small" bordered />
             </template>
           </a-card>
         </a-tab-pane>
@@ -302,7 +336,6 @@
           <a-tag>{{ selectedReport.depth || '-' }}</a-tag>
           <span>{{ selectedReport.created_at || '-' }}</span>
         </a-space>
-        <p class="report-summary">{{ selectedReport.summary || '暂无摘要' }}</p>
         <a-space
           v-if="selectedReport.depth === 'expert'"
           wrap
@@ -314,83 +347,136 @@
           </a-tag>
           <a-tag color="blue">Expert</a-tag>
         </a-space>
+        <template v-if="isExpertReport(selectedReport)">
+          <a-divider orientation="left">经营摘要</a-divider>
+          <div class="business-summary-card">{{ expertExecutiveSummary(selectedReport) }}</div>
 
-        <a-divider orientation="left">洞察</a-divider>
-        <a-list :data-source="selectedReport.insights || []" size="small" bordered>
-          <template #renderItem="{ item }">
-            <a-list-item>
-              <a-space direction="vertical" size="small">
-                <strong>{{ item.title }}</strong>
-                <span>{{ item.detail }}</span>
-              </a-space>
-            </a-list-item>
-          </template>
-        </a-list>
-
-        <template v-if="selectedReport.depth === 'expert'">
-          <a-divider orientation="left">Evidence Chains</a-divider>
-          <a-empty v-if="!(selectedReport.evidence_chains || []).length" description="暂无证据链" />
-          <a-list v-else :data-source="selectedReport.evidence_chains" size="small">
+          <a-divider orientation="left">关键洞察</a-divider>
+          <a-empty v-if="!expertTopInsights(selectedReport).length" description="暂无关键洞察" />
+          <a-list v-else :data-source="expertTopInsights(selectedReport)" size="small" bordered>
             <template #renderItem="{ item }">
               <a-list-item>
-                <div class="evidence-card">
-                  <strong>{{ item.finding || 'Finding' }}</strong>
-                  <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
-                  <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
-                  <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
-                </div>
+                <a-space direction="vertical" size="small">
+                  <strong>{{ displayInsightTitle(item) }}</strong>
+                  <span>{{ displayInsightDetail(item) }}</span>
+                </a-space>
               </a-list-item>
             </template>
           </a-list>
 
-          <a-divider orientation="left">Conversation Timeline</a-divider>
-          <a-empty v-if="!(selectedReport.conversation_chain || []).length" description="暂无 conversation" />
-          <a-collapse v-else>
-            <a-collapse-panel
-              v-for="(round, index) in selectedReport.conversation_chain || []"
-              :key="round.round || index"
-              :header="`Round ${round.round || index + 1}`"
-            >
-              <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
-              <div class="round-result-list" v-if="(round.results || []).length">
-                <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
-                  <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
-                  <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
-                  <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
-                  <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
-                </div>
-              </div>
+          <a-divider orientation="left">动作建议</a-divider>
+          <a-empty v-if="!expertActionItems(selectedReport).length" description="暂无动作建议" />
+          <a-list v-else :data-source="expertActionItems(selectedReport)" size="small" bordered>
+            <template #renderItem="{ item }">
+              <a-list-item>
+                <a-space direction="vertical" size="small">
+                  <strong>{{ displayInsightTitle(item) }}</strong>
+                  <span>{{ displayInsightDetail(item) }}</span>
+                </a-space>
+              </a-list-item>
+            </template>
+          </a-list>
+
+          <a-collapse ghost class="expert-detail-collapse">
+            <a-collapse-panel key="report-detail-analysis" header="详细分析">
+              <a-divider orientation="left">根因分析</a-divider>
+              <a-empty v-if="!(selectedReport.root_causes || []).length" description="暂无根因分析" />
+              <a-list v-else :data-source="selectedReport.root_causes" size="small" bordered />
+
+              <a-divider orientation="left">证据链</a-divider>
+              <a-empty v-if="!(selectedReport.evidence_chains || []).length" description="暂无证据链" />
+              <a-list v-else :data-source="selectedReport.evidence_chains" size="small">
+                <template #renderItem="{ item }">
+                  <a-list-item>
+                    <div class="evidence-card">
+                      <strong>{{ displayFindingTitle(item.finding) }}</strong>
+                      <div class="inline-metric" v-if="displayFindingDetail(item)">{{ displayFindingDetail(item) }}</div>
+                      <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
+                      <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
+                      <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
+                    </div>
+                  </a-list-item>
+                </template>
+              </a-list>
+
+              <a-divider orientation="left">分析过程</a-divider>
+              <a-empty v-if="!(selectedReport.conversation_chain || []).length" description="暂无分析过程" />
+              <a-collapse v-else>
+                <a-collapse-panel
+                  v-for="(round, index) in selectedReport.conversation_chain || []"
+                  :key="round.round || index"
+                  :header="`Round ${round.round || index + 1}`"
+                >
+                  <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
+                  <div class="round-result-list" v-if="(round.results || []).length">
+                    <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
+                      <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
+                      <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
+                      <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
+                      <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
+                    </div>
+                  </div>
+                </a-collapse-panel>
+              </a-collapse>
+
+              <a-divider orientation="left">推理轨迹</a-divider>
+              <a-empty v-if="!(selectedReport.reasoning_traces || []).length" description="暂无推理轨迹" />
+              <a-collapse v-else ghost>
+                <a-collapse-panel
+                  v-for="(trace, index) in selectedReport.reasoning_traces || []"
+                  :key="trace.round || index"
+                  :header="`Round ${trace.round || index + 1}`"
+                >
+                  <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
+                </a-collapse-panel>
+              </a-collapse>
+
+              <a-divider orientation="left">限制说明</a-divider>
+              <a-empty v-if="!(selectedReport.limitations || []).length" description="暂无限制说明" />
+              <a-list v-else :data-source="selectedReport.limitations" size="small" bordered />
+
+              <a-divider orientation="left">执行步骤</a-divider>
+              <a-collapse>
+                <a-collapse-panel
+                  v-for="(step, index) in selectedReport.steps || []"
+                  :key="step.title || index"
+                  :header="step.title || `Step ${index + 1}`"
+                >
+                  <p><strong>问题：</strong> {{ step.question || '-' }}</p>
+                  <pre class="sql-preview">{{ step.sql || '-' }}</pre>
+                </a-collapse-panel>
+              </a-collapse>
             </a-collapse-panel>
           </a-collapse>
-
-          <a-divider orientation="left">Reasoning Trace</a-divider>
-          <a-empty v-if="!(selectedReport.reasoning_traces || []).length" description="暂无 reasoning" />
-          <a-collapse v-else ghost>
-            <a-collapse-panel
-              v-for="(trace, index) in selectedReport.reasoning_traces || []"
-              :key="trace.round || index"
-              :header="`Round ${trace.round || index + 1}`"
-            >
-              <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
-            </a-collapse-panel>
-          </a-collapse>
-
-          <a-divider orientation="left">Limitations</a-divider>
-          <a-empty v-if="!(selectedReport.limitations || []).length" description="暂无限制说明" />
-          <a-list v-else :data-source="selectedReport.limitations" size="small" bordered />
         </template>
 
-        <a-divider orientation="left">步骤</a-divider>
-        <a-collapse>
-          <a-collapse-panel
-            v-for="(step, index) in selectedReport.steps || []"
-            :key="step.title || index"
-            :header="step.title || `Step ${index + 1}`"
-          >
-            <p><strong>问题：</strong> {{ step.question || '-' }}</p>
-            <pre class="sql-preview">{{ step.sql || '-' }}</pre>
-          </a-collapse-panel>
-        </a-collapse>
+        <template v-else>
+          <p class="report-summary">{{ readableSummary(selectedReport) }}</p>
+
+          <a-divider orientation="left">洞察</a-divider>
+          <a-list :data-source="selectedReport.insights || []" size="small" bordered>
+            <template #renderItem="{ item }">
+              <a-list-item>
+                <a-space direction="vertical" size="small">
+                  <strong>{{ displayInsightTitle(item) }}</strong>
+                  <span>{{ displayInsightDetail(item) }}</span>
+                </a-space>
+              </a-list-item>
+            </template>
+          </a-list>
+
+          <a-divider orientation="left">步骤</a-divider>
+          <a-collapse>
+            <a-collapse-panel
+              v-for="(step, index) in selectedReport.steps || []"
+              :key="step.title || index"
+              :header="step.title || `Step ${index + 1}`"
+            >
+              <p><strong>问题：</strong> {{ step.question || '-' }}</p>
+              <pre class="sql-preview">{{ step.sql || '-' }}</pre>
+            </a-collapse-panel>
+          </a-collapse>
+        </template>
       </template>
     </a-drawer>
 
@@ -905,6 +991,148 @@ const formatJson = (value: unknown) => {
   return JSON.stringify(value, null, 2);
 };
 
+const parseStructuredValue = (value: any): Record<string, any> => {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return typeof parsed === 'object' && parsed ? parsed : { detail: value };
+    } catch {
+      return { detail: value };
+    }
+  }
+  return { detail: String(value) };
+};
+
+const joinInsightParts = (payload: Record<string, any>) => {
+  const parts = [
+    payload.detail,
+    payload.description,
+    payload.quantification,
+    payload.business_impact,
+    payload.evidence,
+    payload.recommendation,
+  ]
+    .filter((value, index, array) => typeof value === 'string' && value.trim() && array.indexOf(value) === index)
+    .map((value) => String(value).trim());
+  return parts.join('；');
+};
+
+const displayInsightTitle = (item: any) => {
+  const payload = parseStructuredValue(item);
+  return payload.title || payload.category || payload.headline || '洞察';
+};
+
+const displayInsightDetail = (item: any) => {
+  const payload = parseStructuredValue(item);
+  const detail = joinInsightParts(payload);
+  if (detail) return detail;
+  if (typeof item === 'string') return item;
+  return '暂无明细';
+};
+
+const displayFindingTitle = (finding: any) => {
+  const payload = parseStructuredValue(finding);
+  return payload.title || payload.category || payload.headline || payload.description || '关键发现';
+};
+
+const displayFindingDetail = (item: any) => {
+  const payload = parseStructuredValue(item?.finding);
+  const detail = item?.detail || joinInsightParts(payload);
+  return detail || '';
+};
+
+const isExpertReport = (report: AnalysisReport | null) => (report?.depth || '').toLowerCase() === 'expert';
+
+const sanitizeSummaryText = (value?: string | null) =>
+  (value || '')
+    .split(/[。！？!?]/)
+    .map((part) => part.trim())
+    .filter(
+      (part) =>
+        part &&
+        !part.toLowerCase().includes('descriptive -> diagnostic -> predictive') &&
+        !part.toLowerCase().includes('methodology') &&
+        !part.includes('方法论'),
+    )
+    .slice(0, 2)
+    .join('；');
+
+const normalizeNarrativeItems = (items: any[] | undefined, defaultPrefix: string, limit: number = 3) =>
+  (items || [])
+    .map((item, index) => {
+      const payload = parseStructuredValue(item);
+      const title =
+        payload.title ||
+        payload.category ||
+        payload.headline ||
+        payload.theme ||
+        `${defaultPrefix} ${index + 1}`;
+      const detail = joinInsightParts(payload) || (typeof item === 'string' ? item.trim() : '');
+      return {
+        title,
+        detail: detail || title,
+        severity: payload.severity,
+        urgency: payload.urgency,
+      };
+    })
+    .filter((item) => item.title || item.detail)
+    .slice(0, limit);
+
+const expertTopInsights = (report: AnalysisReport | null) => {
+  if (!report) return [];
+  return normalizeNarrativeItems((report.top_insights as any[]) || (report.insights as any[]), '关键洞察');
+};
+
+const expertActionItems = (report: AnalysisReport | null) => {
+  if (!report) return [];
+  return normalizeNarrativeItems((report.action_items as any[]) || (report.recommendations as any[]), '动作建议');
+};
+
+const expertExecutiveSummary = (report: AnalysisReport | null) => {
+  if (!report) return '暂无经营摘要';
+  const sanitized = sanitizeSummaryText(report.executive_summary || report.summary);
+  if (sanitized) return sanitized + '。';
+  const insightItems = expertTopInsights(report);
+  if (insightItems.length) {
+    return (
+      insightItems
+        .slice(0, 2)
+        .map((item) => `${item.title}：${item.detail}`)
+        .join('；')
+        .slice(0, 120) + '。'
+    );
+  }
+  const actionItems = expertActionItems(report);
+  const firstAction = actionItems[0];
+  if (firstAction) {
+    return `${firstAction.title}：${firstAction.detail}`.slice(0, 120) + '。';
+  }
+  return '暂无经营摘要';
+};
+
+const readableSummary = (report: AnalysisReport | null) => {
+  if (!report) return '暂无摘要';
+  if (isExpertReport(report)) {
+    return expertExecutiveSummary(report);
+  }
+  const rawSummary = (report.summary || '').trim();
+  const sanitized = sanitizeSummaryText(rawSummary);
+  if (sanitized) return sanitized + '。';
+
+  const insightItems = (report.insights || []).slice(0, 2);
+  if (insightItems.length) {
+    return (
+      insightItems
+        .map((item) => `${displayInsightTitle(item)}：${displayInsightDetail(item)}`)
+        .join('；')
+        .slice(0, 120) + '。'
+    );
+  }
+  return rawSummary || '暂无摘要';
+};
+
 const formatDuration = (durationMs?: number) => {
   if (!durationMs) return '耗时 -';
   return `耗时 ${(durationMs / 1000).toFixed(1)}s`;
@@ -935,6 +1163,15 @@ onMounted(async () => {
   line-height: 1.6;
 }
 
+.business-summary-card {
+  padding: 14px 16px;
+  border: 1px solid #d9e3f0;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  color: #24324a;
+  line-height: 1.8;
+}
+
 .report-metrics {
   row-gap: 8px;
 }
@@ -950,6 +1187,10 @@ onMounted(async () => {
 
 .expert-mode-note {
   margin-bottom: 16px;
+}
+
+.expert-detail-collapse {
+  margin-top: 16px;
 }
 
 .evidence-card {

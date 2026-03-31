@@ -31,6 +31,7 @@ _EXPERT_RESULT_ROW_LIMIT = 100
 _EXPERT_CONTEXT_ROW_LIMIT = 20
 _EXPERT_CONTEXT_COLUMN_LIMIT = 5
 _EXPERT_FALLBACK_DEPTH = "deep"
+_EXPERT_MAIN_SECTION_LIMIT = 3
 
 
 class AnalystAgent:
@@ -386,9 +387,46 @@ class AnalystAgent:
         *,
         include_reasoning: bool = False,
     ) -> Dict[str, Any]:
-        payload = dict(report or {})
+        payload = self._hydrate_expert_sections(dict(report or {}))
         if not include_reasoning:
             payload.pop("reasoning_traces", None)
+        return payload
+
+    def _hydrate_expert_sections(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(report or {})
+        if (payload.get("depth") or "").strip().lower() != "expert":
+            return payload
+
+        raw_findings = [
+            self._coerce_expert_item(item)
+            for item in (
+                payload.get("findings")
+                or payload.get("insights")
+                or payload.get("top_insights")
+                or []
+            )
+        ]
+        insights = self._normalize_expert_findings(raw_findings)
+        recommendations = self._normalize_expert_text_list(payload.get("recommendations") or [])
+        action_items = self._normalize_expert_action_items(
+            payload.get("action_items") or payload.get("recommendations") or [],
+            raw_findings,
+        )
+        if not recommendations and action_items:
+            recommendations = [self._action_item_as_text(item) for item in action_items]
+
+        executive_summary = self._normalize_expert_summary(
+            payload.get("executive_summary") or payload.get("summary"),
+            insights[:_EXPERT_MAIN_SECTION_LIMIT],
+            recommendations[:_EXPERT_MAIN_SECTION_LIMIT],
+        )
+
+        payload["summary"] = executive_summary
+        payload["executive_summary"] = executive_summary
+        payload["insights"] = insights
+        payload["top_insights"] = insights[:_EXPERT_MAIN_SECTION_LIMIT]
+        payload["recommendations"] = recommendations
+        payload["action_items"] = action_items[:_EXPERT_MAIN_SECTION_LIMIT]
         return payload
 
     def _profile_table(
@@ -895,8 +933,13 @@ class AnalystAgent:
             f"Original data context:\n{base_context}\n\n"
             f"Full compressed analysis history: {context}\n\n"
             "Synthesize the full analysis into a final verdict.\n"
-            "Return JSON with `summary`, `findings`, `anomalies`, `root_causes`, "
-            "`recommendations`, `limitations`, `confidence_overall`, and `continue`."
+            "Return JSON with:\n"
+            "- `summary`: a concise Chinese executive summary for business readers, 2-3 sentences, "
+            "no methodology narration, no raw JSON\n"
+            "- `findings`: an array of objects with `title`, `detail`, optional `severity`, "
+            "`quantification`, and optional `recommendation`, sorted by business impact\n"
+            "- `recommendations`: at most 3 action items, each as string or object with `title`, `detail`, optional `urgency`\n"
+            "- `anomalies`, `root_causes`, `limitations`, `confidence_overall`, and `continue`."
         )
 
     def _extract_queries_from_strategist(
@@ -1021,11 +1064,15 @@ class AnalystAgent:
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         final_output = (compressed_history[-1] or {}).get("strategist_output") if compressed_history else {}
-        findings = list(final_output.get("findings") or [])
-        anomalies = list(final_output.get("anomalies") or [])
-        recommendations = list(final_output.get("recommendations") or [])
-        limitations = list(final_output.get("limitations") or [])
-        root_causes = list(final_output.get("root_causes") or [])
+        raw_findings = [self._coerce_expert_item(item) for item in (final_output.get("findings") or [])]
+        findings = self._normalize_expert_findings(raw_findings)
+        anomalies = self._normalize_expert_findings(final_output.get("anomalies") or [], default_prefix="异常")
+        recommendations = self._normalize_expert_text_list(final_output.get("recommendations") or [])
+        action_items = self._normalize_expert_action_items(final_output.get("recommendations") or [], raw_findings)
+        if not recommendations and action_items:
+            recommendations = [self._action_item_as_text(item) for item in action_items]
+        limitations = self._normalize_expert_text_list(final_output.get("limitations") or [])
+        root_causes = self._normalize_expert_text_list(final_output.get("root_causes") or [])
         failed_step_count = sum(1 for step in all_step_results if not step.get("success"))
         if failed_step_count == len(all_step_results) and all_step_results:
             status = "failed"
@@ -1042,16 +1089,22 @@ class AnalystAgent:
             "depth": "expert",
             "schedule_id": schedule_id,
             "history_id": history_id,
-            "summary": final_output.get("summary") or "Expert analysis completed.",
+            "summary": self._normalize_expert_summary(
+                final_output.get("summary"),
+                findings[:_EXPERT_MAIN_SECTION_LIMIT],
+                recommendations[:_EXPERT_MAIN_SECTION_LIMIT],
+            ),
             "profile": profile,
             "insights": findings,
+            "top_insights": findings[:_EXPERT_MAIN_SECTION_LIMIT],
             "anomalies": anomalies,
             "recommendations": recommendations,
+            "action_items": action_items[:_EXPERT_MAIN_SECTION_LIMIT],
             "limitations": limitations,
             "root_causes": root_causes,
             "conversation_chain": list(compressed_history),
             "reasoning_traces": list(reasoning_traces),
-            "evidence_chains": self._build_evidence_chains(findings, compressed_history),
+            "evidence_chains": self._build_evidence_chains(raw_findings, compressed_history),
             "confidence_ratings": {"overall": final_output.get("confidence_overall")},
             "steps": list(all_step_results),
             "insight_count": len(findings),
@@ -1062,6 +1115,7 @@ class AnalystAgent:
             "duration_ms": int((time.time() - started_at) * 1000),
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         }
+        report["executive_summary"] = report["summary"]
         if note:
             report["note"] = note
         return report
@@ -1119,13 +1173,206 @@ class AnalystAgent:
 
             evidence_chains.append(
                 {
-                    "finding": finding_payload.get("title") or finding_payload,
+                    "finding": (
+                        finding_payload.get("title")
+                        or finding_payload.get("category")
+                        or finding_payload.get("headline")
+                        or finding_payload.get("description")
+                        or finding_payload
+                    ),
+                    "detail": self._compose_expert_detail(finding_payload),
                     "hypotheses": matched_hypotheses,
                     "assessments": matched_assessments,
                     "follow_ups": matched_follow_ups,
                 }
             )
         return evidence_chains
+
+    def _coerce_expert_item(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.startswith("{") and cleaned.endswith("}"):
+                parsed = self._parse_json_from_text(cleaned)
+                if parsed:
+                    return parsed
+            return {"detail": value}
+        if value is None:
+            return {}
+        return {"detail": str(value)}
+
+    def _normalize_expert_findings(
+        self,
+        items: Sequence[Any],
+        *,
+        default_prefix: str = "洞察",
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for index, item in enumerate(items):
+            payload = self._coerce_expert_item(item)
+            title = (
+                payload.get("title")
+                or payload.get("category")
+                or payload.get("headline")
+                or payload.get("theme")
+                or f"{default_prefix} {index + 1}"
+            )
+            detail = self._compose_expert_detail(payload, include_recommendation=False) or str(title)
+            normalized_item = {
+                "title": str(title),
+                "detail": detail,
+            }
+            if payload.get("severity"):
+                normalized_item["severity"] = payload.get("severity")
+            normalized.append(normalized_item)
+        return normalized
+
+    def _normalize_expert_text_list(self, items: Sequence[Any]) -> List[str]:
+        normalized: List[str] = []
+        for item in items:
+            payload = self._coerce_expert_item(item)
+            title = payload.get("title") or payload.get("category") or payload.get("headline")
+            detail = self._compose_expert_detail(payload)
+            if title and detail:
+                normalized.append(f"{title}：{detail}")
+            elif title:
+                normalized.append(str(title))
+            elif detail:
+                normalized.append(detail)
+        return normalized
+
+    def _normalize_expert_action_items(
+        self,
+        items: Sequence[Any],
+        findings: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str]] = set()
+
+        def append_item(title: Optional[str], detail: Optional[str], urgency: Optional[Any] = None) -> None:
+            clean_title = str(title or f"动作建议 {len(normalized) + 1}").strip()
+            clean_detail = str(detail or "").strip() or clean_title
+            marker = (clean_title, clean_detail)
+            if marker in seen:
+                return
+            seen.add(marker)
+            item = {"title": clean_title, "detail": clean_detail}
+            if urgency:
+                item["urgency"] = urgency
+            normalized.append(item)
+
+        for item in items:
+            payload = self._coerce_expert_item(item)
+            title = payload.get("title") or payload.get("category") or payload.get("headline") or payload.get("action")
+            detail = self._compose_expert_action_detail(payload)
+            append_item(title, detail, payload.get("urgency"))
+            if len(normalized) >= _EXPERT_MAIN_SECTION_LIMIT:
+                return normalized
+
+        for finding in findings:
+            recommendation = finding.get("recommendation")
+            if not recommendation:
+                continue
+            title = finding.get("title") or finding.get("category") or finding.get("headline")
+            detail = str(recommendation).strip()
+            implication = finding.get("implication") or finding.get("business_impact")
+            if implication:
+                detail = f"{detail}；预期影响：{str(implication).strip()}"
+            append_item(title, detail)
+            if len(normalized) >= _EXPERT_MAIN_SECTION_LIMIT:
+                return normalized
+
+        return normalized
+
+    def _action_item_as_text(self, item: Dict[str, Any]) -> str:
+        title = str(item.get("title") or "").strip()
+        detail = str(item.get("detail") or "").strip()
+        if title and detail and title != detail:
+            return f"{title}：{detail}"
+        return detail or title
+
+    def _compose_expert_detail(self, payload: Dict[str, Any], *, include_recommendation: bool = True) -> str:
+        parts: List[str] = []
+        keys = [
+            "detail",
+            "description",
+            "quantification",
+            "business_impact",
+            "evidence",
+            "implication",
+        ]
+        if include_recommendation:
+            keys.append("recommendation")
+        for key in keys:
+            value = payload.get(key)
+            if value:
+                text = str(value).strip()
+                if text and text not in parts:
+                    parts.append(text)
+        return "；".join(parts)
+
+    def _compose_expert_action_detail(self, payload: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in (
+            "detail",
+            "action",
+            "description",
+            "recommendation",
+            "expected_outcome",
+            "business_impact",
+            "owner_hint",
+            "urgency",
+        ):
+            value = payload.get(key)
+            if value:
+                text = str(value).strip()
+                if text and text not in parts:
+                    parts.append(text)
+        return "；".join(parts)
+
+    def _normalize_expert_summary(
+        self,
+        summary: Any,
+        insights: Sequence[Dict[str, Any]],
+        recommendations: Sequence[str],
+    ) -> str:
+        text = str(summary or "").strip()
+        if text:
+            cleaned_sentences = []
+            for sentence in re.split(r"[。！？!?]", text):
+                normalized = sentence.strip()
+                lowered = normalized.lower()
+                if not normalized:
+                    continue
+                if "descriptive -> diagnostic -> predictive" in lowered:
+                    continue
+                if "methodology" in lowered or "方法论" in normalized:
+                    continue
+                cleaned_sentences.append(normalized)
+            if cleaned_sentences:
+                candidate = "；".join(cleaned_sentences[:2]).strip("； ")
+                if candidate:
+                    return self._shorten_expert_text(candidate + "。", 120)
+
+        if insights:
+            parts = []
+            for insight in insights[:2]:
+                title = insight.get("title") or "关键洞察"
+                detail = self._shorten_expert_text(insight.get("detail") or "", 36)
+                parts.append(f"{title}：{detail}" if detail else str(title))
+            return "；".join(parts) + "。"
+
+        if recommendations:
+            return self._shorten_expert_text(f"本次 expert 分析已完成，建议优先执行：{recommendations[0]}", 120)
+
+        return "本次 expert 分析已完成，请优先查看下方关键洞察与建议。"
+
+    def _shorten_expert_text(self, text: str, max_chars: int) -> str:
+        normalized = re.sub(r"\s+", " ", (text or "").strip())
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max_chars - 1].rstrip("；，, ") + "…"
 
     def _extract_evidence_ids(self, finding: Dict[str, Any]) -> set[str]:
         values: set[str] = set()

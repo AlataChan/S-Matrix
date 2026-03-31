@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 from analyst_agent import AnalystAgent
@@ -357,30 +358,39 @@ def test_call_strategist_reasoner_uses_user_only_message_and_captures_reasoning(
     agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "unused"})
     captured = {}
 
-    class FakeResponse:
+    class FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
         def raise_for_status(self):
             return None
 
-        def json(self):
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"summary":"ok","continue":false}',
-                            "reasoning_content": "step by step",
-                        }
-                    }
-                ]
-            }
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"reasoning_content":"step by step"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"{\\"summary\\":\\"ok\\",\\"continue\\":false}"}}]}'
+            yield "data: [DONE]"
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["json"] = json
-        captured["timeout"] = timeout
-        return FakeResponse()
+    class FakeClient:
+        def __init__(self, timeout=None):
+            captured["timeout"] = timeout
 
-    monkeypatch.setattr(analyst_agent_module.requests, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
     payload = agent._call_strategist(
         "Investigate the data",
@@ -388,10 +398,12 @@ def test_call_strategist_reasoner_uses_user_only_message_and_captures_reasoning(
     )
 
     assert captured["url"] == "https://api.example.com/chat/completions"
+    assert captured["method"] == "POST"
     assert captured["json"]["messages"] == [{"role": "user", "content": "Investigate the data"}]
     assert captured["json"]["max_tokens"] == 8000
+    assert captured["json"]["stream"] is True
     assert "temperature" not in captured["json"]
-    assert captured["timeout"] == 120
+    assert captured["timeout"].read == 300
     assert payload["reasoning"] == "step by step"
     assert payload["response"]["summary"] == "ok"
 
@@ -400,19 +412,35 @@ def test_call_strategist_non_reasoner_avoids_generic_system_prompt(monkeypatch):
     agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "unused"})
     captured = {}
 
-    class FakeResponse:
+    class FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
         def raise_for_status(self):
             return None
 
-        def json(self):
-            return {"choices": [{"message": {"content": '{"summary":"ok","continue":false}'}}]}
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"{\\"summary\\":\\"ok\\",\\"continue\\":false}"}}]}'
+            yield "data: [DONE]"
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        captured["json"] = json
-        captured["timeout"] = timeout
-        return FakeResponse()
+    class FakeClient:
+        def __init__(self, timeout=None):
+            captured["timeout"] = timeout
 
-    monkeypatch.setattr(analyst_agent_module.requests, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            captured["json"] = json
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
     payload = agent._call_strategist(
         "Investigate the data",
@@ -421,7 +449,8 @@ def test_call_strategist_non_reasoner_avoids_generic_system_prompt(monkeypatch):
 
     assert captured["json"]["messages"] == [{"role": "user", "content": "Investigate the data"}]
     assert captured["json"]["temperature"] == 0.1
-    assert captured["timeout"] == 60
+    assert captured["json"]["stream"] is True
+    assert captured["timeout"].read == 120
     assert payload["response"]["summary"] == "ok"
 
 
@@ -678,7 +707,7 @@ def test_analyze_table_expert_supports_three_round_synthesis_without_followup_qu
 
     report = agent.analyze_table_expert("sales")
 
-    assert report["summary"] == "final synthesis"
+    assert report["summary"].startswith("final synthesis")
     assert len(report["conversation_chain"]) == 3
     assert report["steps"][0]["round"] == 1
 
@@ -727,6 +756,84 @@ def test_build_evidence_chains_scopes_history_per_finding():
     assert chains[1]["follow_ups"] == [{"id": "F2", "hypothesis_id": "H2", "reason": "Verify profit"}]
 
 
+def test_build_expert_report_normalizes_findings_into_readable_insights():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    report = agent._build_expert_report(
+        table_names=["warehouse_stock_in_items"],
+        profile={"row_count": 608, "sampled": False, "sample_size": 608, "columns": {}},
+        compressed_history=[
+            {
+                "round": 3,
+                "strategist_output": {
+                    "summary": (
+                        "分析遵循 descriptive -> diagnostic -> predictive 方法论。"
+                        "当前运营存在显著供应链集中风险与数据治理缺口。"
+                    ),
+                    "findings": [
+                        (
+                            '{"category":"供应链风险","description":"供应商集中度过高，单一供应商覆盖核心门店。",'
+                            '"quantification":"核心供应商覆盖6家门店与4个仓库。","recommendation":"优先推进替代供应商。"}'
+                        ),
+                        {
+                            "category": "库存价值集中",
+                            "description": "Top 10% 商品贡献 67.02% 的总入库金额。",
+                            "quantification": "高价值商品波动明显。",
+                        },
+                    ],
+                    "recommendations": ["优先推进替代供应商。"],
+                    "anomalies": [],
+                    "limitations": [],
+                    "root_causes": [],
+                    "confidence_overall": 0.82,
+                    "continue": False,
+                },
+                "results": [],
+            }
+        ],
+        reasoning_traces=[],
+        all_step_results=[],
+        trigger_type="table_analysis",
+        started_at=0.0,
+    )
+
+    assert "descriptive -> diagnostic -> predictive" not in report["summary"]
+    assert "供应链集中风险" in report["summary"]
+    assert report["executive_summary"] == report["summary"]
+    assert len(report["top_insights"]) == 2
+    assert report["top_insights"][0]["title"] == "供应链风险"
+    assert report["top_insights"][1]["title"] == "库存价值集中"
+    assert report["action_items"][0]["title"] == "动作建议 1"
+    assert "优先推进替代供应商" in report["action_items"][0]["detail"]
+    assert report["insights"][0]["title"] == "供应链风险"
+    assert "供应商集中度过高" in report["insights"][0]["detail"]
+    assert "核心供应商覆盖6家门店与4个仓库" in report["insights"][0]["detail"]
+    assert report["insights"][1]["title"] == "库存价值集中"
+
+
+def test_build_evidence_chains_uses_readable_label_when_finding_has_no_title():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    chains = agent._build_evidence_chains(
+        [
+            {
+                "category": "供应链风险",
+                "description": "供应商集中度极高",
+                "hypothesis_id": "H1",
+            }
+        ],
+        [
+            {
+                "round": 1,
+                "strategist_output": {"hypotheses": [{"id": "H1", "title": "供应商集中"}]},
+                "results": [],
+            }
+        ],
+    )
+
+    assert chains[0]["finding"] == "供应链风险"
+
+
 def test_get_report_and_latest_report_hide_reasoning_by_default():
     class ReportDB(RecordingDB):
         def execute_query(self, sql, params=None):
@@ -747,3 +854,42 @@ def test_get_report_and_latest_report_hide_reasoning_by_default():
     assert "reasoning_traces" not in detail
     assert with_reasoning["reasoning_traces"][0]["trace"] == "secret"
     assert "reasoning_traces" not in latest
+
+
+def test_get_report_hydrates_fixed_expert_sections_for_legacy_reports():
+    class ReportDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            payload = {
+                "success": True,
+                "id": "report-legacy",
+                "table_names": "warehouse_stock_in_items",
+                "depth": "expert",
+                "summary": "分析遵循 descriptive -> diagnostic -> predictive 方法论。库存风险集中。",
+                "insights": [
+                    '{"category":"供应链风险","description":"单一供应商覆盖核心门店。","recommendation":"引入备份供应商。"}',
+                    {"category": "库存价值集中", "description": "高价值商品波动明显。"},
+                    {"category": "数据治理缺口", "description": "关键字段缺失。"},
+                    {"category": "额外洞察", "description": "不应进入 top 3。"},
+                ],
+                "recommendations": [
+                    "优先补齐主数据字段。",
+                    {"title": "供应链韧性", "detail": "建立第二供应源。"},
+                    "优化高价值库存阈值。",
+                    "超出上限的建议。",
+                ],
+                "reasoning_traces": [{"round": 1, "trace": "secret"}],
+            }
+            return [{"report_json": payload}]
+
+    agent = AnalystAgent(ReportDB(), lambda **kwargs: {"api_key": "key"})
+
+    report = agent.get_report("report-legacy")
+
+    assert report["executive_summary"] == "库存风险集中。"
+    assert len(report["top_insights"]) == 3
+    assert [item["title"] for item in report["top_insights"]] == ["供应链风险", "库存价值集中", "数据治理缺口"]
+    assert len(report["action_items"]) == 3
+    assert report["action_items"][0]["title"] == "动作建议 1"
+    assert "优先补齐主数据字段" in report["action_items"][0]["detail"]
+    assert report["action_items"][1]["title"] == "供应链韧性"
+    assert report["recommendations"][1] == "供应链韧性：建立第二供应源。"

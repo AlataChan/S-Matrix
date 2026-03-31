@@ -148,6 +148,7 @@ export interface AnalysisInsight {
   title: string;
   detail: string;
   severity?: string;
+  urgency?: string;
 }
 
 export type AnalysisDepth = 'quick' | 'standard' | 'deep' | 'expert';
@@ -160,9 +161,12 @@ export interface AnalysisReport {
   schedule_id?: string | null;
   history_id?: string | null;
   summary?: string;
+  executive_summary?: string;
   insights?: AnalysisInsight[];
+  top_insights?: AnalysisInsight[];
   anomalies?: any[];
   recommendations?: string[];
+  action_items?: AnalysisInsight[];
   limitations?: string[];
   root_causes?: any[];
   conversation_chain?: any[];
