@@ -1,6 +1,6 @@
 # S-Matrix Progress
 
-> 最后更新：2026-03-28（全部 Phase 开发完成并完成回归）
+> 最后更新：2026-04-01（Expert 模式完成经营视图优化与混合式时间规划）
 > 当前阶段：Completed
 
 ---
@@ -83,6 +83,13 @@
 | P5-T3 | ✅ | 新增 `embedding.py`，历史写入时同步生成 embedding |
 | P5-T4 | ✅ | `get_similar_question_sql()` 改为向量优先检索，文本检索回退 |
 
+### Post-Phase Enhancements
+
+| 任务 | 状态 | 落地内容 |
+| ---- | ---- | -------- |
+| EXP-1 | ✅ | Expert 报告主视图改为固定经营版式：`经营摘要 + 关键洞察 + 动作建议`，详细分析折叠保留证据链、根因、conversation、reasoning 与执行步骤 |
+| EXP-2 | ✅ | Expert 分析改为混合式时间规划：后端先探测时间列跨度/稠密度/缺失率并给出 `day/week/month/quarter/year` 候选粒度，strategist 再选择 1-2 个高价值时间计划，executor 按允许时间列、粒度、窗口上限执行 |
+
 ---
 
 ## 测试与验收
@@ -101,19 +108,19 @@
 
 | 检查项 | 命令 | 结果 |
 | ---- | ---- | ---- |
-| 后端测试总集 | `pytest doris-api/tests -q` | ✅ `24 passed` |
+| 后端测试总集 | `docker exec smatrix-api python -m pytest tests/ -q` | ✅ `51 passed, 4 skipped, 0 warnings` |
+| Expert 分析链路回归 | `docker run --rm -v /Users/apple/S-Matrix/doris-api:/app -w /app s-matrix-smatrix-api python -m pytest tests/test_analyst_agent.py tests/test_analysis_api.py tests/test_analysis_scheduler.py tests/test_analysis_dispatcher.py tests/test_docker_startup_resilience.py -q` | ✅ `84 passed`（2026-04-01） |
 | 前端构建 | `npm run build` | ✅ 通过 |
 | Python 编译检查 | `python -m compileall doris-api` | ✅ 通过 |
 | MCP Server 工具枚举 | `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \| python doris-api/mcp_server.py` | ✅ 通过 |
-| 黄金测试集直连本机 API | `python doris-api/tests/run_golden.py --base-url http://localhost:38018` | ⚠️ 当前机器无运行中的 API 服务，`NO_PROXY` 直连后为 `connection refused` |
+| 黄金测试集 live API | `run_golden.py --base-url http://localhost:38018` | ✅ **5/5 通过**（2026-03-30 验收） |
 
 ---
 
 ## 风险与备注
 
-- Phase 5 已实现向量写入和向量检索；ANN 索引创建属于 best-effort，因为当前 Doris 运行环境需真实在线后才能最终确认索引成功落地。
-- 黄金集 runner 已创建并可直接用于真实环境验收，但本次会话未启动本地 Doris/API 进程，因此未完成 live API 级别的黄金集通过。
-- 当前残余 warning 主要来自 FastAPI `on_event` 弃用和现有 Pydantic 模型命名冲突，不影响本轮功能验收。
+- Phase 5 向量列 `question_embedding ARRAY<FLOAT>` 已落地，20 条记录含 512 维 embedding，向量检索功能正常。ANN（HNSW）索引因 Doris 4.0-rc02 限制（仅支持建表时创建，不支持 ALTER/CREATE INDEX 追加）未建成，当前为全表扫描匹配。数据量 <10K 条时性能无影响；后续若需 ANN 加速，需重建表或等待 Doris 后续版本支持。
+- 弃用警告已全部清理（2026-03-30）：FastAPI `on_event` → `lifespan`；Pydantic `class Config` → `model_config = ConfigDict(...)`；`model_name` protected namespace 冲突 → `protected_namespaces=()`。
 
 ---
 
@@ -124,3 +131,6 @@
 | 2026-03-28 | 完成 SEC + Phase 1-5 全部开发、测试和文档回写 | `.plans/*`、`doris-api/*`、`docker-compose.yml` |
 | 2026-03-28 | 新增 MCP Server、embedding、repair agent、golden tests | `doris-api/mcp_server.py`、`doris-api/embedding.py`、`doris-api/repair_agent.py`、`doris-api/tests/*` |
 | 2026-03-28 | 修复密钥管理、Bearer 认证、UUID 历史记录与关系表 | `docker-compose.yml`、`main.py`、`vanna_doris.py`、`datasource_handler.py` |
+| 2026-03-30 | 集成验收：创建 golden_runner.py、黄金测试 5/5 通过、清理弃用警告（lifespan + ConfigDict + protected_namespaces）、确认向量索引状态 | `doris-api/tests/golden_runner.py`、`doris-api/tests/golden_queries.json`、`doris-api/main.py` |
+| 2026-03-31 | Expert 报告改为经营友好版式，兼容历史报告的洞察/建议兜底渲染 | `doris-api/analyst_agent.py`、`doris-frontend/src/components/DataAnalysis.vue`、`doris-frontend/src/api/doris.ts` |
+| 2026-04-01 | Expert 分析升级为混合式时间规划：时间维度探测、候选粒度选择、strategist time_plan、executor 时间边界与 fallback SQL | `doris-api/analyst_agent.py`、`doris-api/tests/test_analyst_agent.py` |

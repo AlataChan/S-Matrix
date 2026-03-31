@@ -7,3 +7,5 @@ dist/
 .env
 .reports/
 .worktrees/
+.plans/progress.local.md
+doris-api/tests/golden_queries.local.json

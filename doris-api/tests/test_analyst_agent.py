@@ -454,16 +454,60 @@ def test_call_strategist_non_reasoner_avoids_generic_system_prompt(monkeypatch):
     assert payload["response"]["summary"] == "ok"
 
 
-def test_compute_statistical_facts_queries_growth_outlier_and_correlation():
+def test_detect_temporal_dimensions_returns_candidates_and_limits():
     class StatsDB(RecordingDB):
         def execute_query(self, sql, params=None):
             self.queries.append((sql, params))
             compact_sql = " ".join(sql.split())
-            if "DATE_FORMAT(`order_date`, '%Y-%m')" in compact_sql:
+            if "MIN(`order_date`) AS min_value" in compact_sql:
                 return [
-                    {"period": "2026-03", "metric_value": 120.0},
-                    {"period": "2026-02", "metric_value": 100.0},
+                    {
+                        "min_value": "2024-01-01 00:00:00",
+                        "max_value": "2026-03-31 00:00:00",
+                        "non_null_count": 800,
+                        "distinct_day_count": 500,
+                    }
                 ]
+            if "MIN(`snapshot_month`) AS min_value" in compact_sql:
+                return [
+                    {
+                        "min_value": "2024-01-01",
+                        "max_value": "2026-03-01",
+                        "non_null_count": 24,
+                        "distinct_day_count": 24,
+                    }
+                ]
+            return []
+
+    agent = AnalystAgent(StatsDB(), lambda **kwargs: {"api_key": "key"})
+    dimensions = agent._detect_temporal_dimensions(
+        "`sales`",
+        {
+            "row_count": 1000,
+            "sampled": False,
+            "sample_size": 1000,
+            "columns": {
+                "order_date": {"type": "DATETIME", "null_rate": 0.2},
+                "snapshot_month": {"type": "DATE", "null_rate": 0.0},
+                "revenue": {"type": "DOUBLE"},
+            },
+        },
+    )
+
+    assert dimensions[0]["column"] == "order_date"
+    assert dimensions[0]["candidate_grains"] == ["day", "week", "month", "quarter", "year"]
+    assert dimensions[0]["recommended_grains"] == ["month", "quarter"]
+    assert dimensions[0]["time_window_limits"]["month"] == 28
+    assert dimensions[1]["column"] == "snapshot_month"
+    assert dimensions[1]["candidate_grains"] == ["month", "quarter", "year"]
+    assert dimensions[1]["recommended_grains"] == ["month", "quarter"]
+
+
+def test_compute_statistical_facts_includes_temporal_dimension_candidates():
+    class StatsDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            self.queries.append((sql, params))
+            compact_sql = " ".join(sql.split())
             if "NTILE(10) OVER (ORDER BY `revenue` DESC)" in compact_sql:
                 return [{"top_share_pct": 37.5}]
             if "COUNT(*) AS outlier_count" in compact_sql and "`revenue`" in compact_sql:
@@ -486,12 +530,168 @@ def test_compute_statistical_facts_queries_growth_outlier_and_correlation():
                 "profit": {"type": "DOUBLE", "avg": 5.0, "stddev": 2.0, "min": 0.0, "max": 15.0},
             },
         },
+        temporal_dimensions=[
+            {
+                "column": "order_date",
+                "candidate_grains": ["week", "month", "quarter"],
+                "recommended_grains": ["month", "quarter"],
+                "time_window_limits": {"week": 52, "month": 24, "quarter": 8},
+                "span_days": 420,
+                "density_ratio": 0.71,
+                "null_rate": 0.05,
+            }
+        ],
     )
 
-    assert any(fact.get("type") == "growth" and fact.get("column") == "revenue" for fact in facts)
+    assert any(fact.get("type") == "temporal_dimension" and fact.get("column") == "order_date" for fact in facts)
     assert any(fact.get("type") == "concentration" and fact.get("column") == "revenue" for fact in facts)
     assert any(fact.get("type") == "outlier" and fact.get("column") == "revenue" for fact in facts)
     assert any(fact.get("type") == "correlation" and fact.get("columns") == ["revenue", "profit"] for fact in facts)
+
+
+def test_build_round_prompt_requests_temporal_plans_from_candidates():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    prompt = agent._build_round_prompt(
+        1,
+        {"row_count": 500},
+        [
+            {
+                "type": "temporal_dimension",
+                "column": "order_date",
+                "candidate_grains": ["week", "month", "quarter"],
+                "recommended_grains": ["month", "quarter"],
+                "time_window_limits": {"week": 52, "month": 24, "quarter": 8},
+            }
+        ],
+        {"table_name": "sales"},
+        [],
+    )
+
+    assert "time_plan" in prompt
+    assert "candidate_grains" in prompt
+    assert "lookback_periods" in prompt
+    assert "choose at most 1-2 temporal analysis plans" in prompt.lower()
+
+
+def test_extract_queries_from_strategist_preserves_time_plan():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    queries = agent._extract_queries_from_strategist(
+        {
+            "response": {
+                "hypotheses": [
+                    {
+                        "id": "H1",
+                        "title": "收入趋势",
+                        "query_description": "查看收入变化趋势",
+                        "time_plan": {
+                            "time_column": "order_date",
+                            "grain": "month",
+                            "analysis_type": "trend",
+                            "comparison_mode": "mom",
+                            "lookback_periods": 18,
+                        },
+                    }
+                ]
+            }
+        },
+        1,
+    )
+
+    assert queries[0]["time_plan"]["time_column"] == "order_date"
+    assert queries[0]["time_plan"]["grain"] == "month"
+
+
+def test_executor_translate_to_sql_includes_temporal_constraints(monkeypatch):
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+    captured = {}
+
+    def fake_call_chat_completion(system_prompt, user_prompt, api_config):
+        captured["prompt"] = user_prompt
+        return "SELECT DATE_FORMAT(`order_date`, '%Y-%m') AS period, COUNT(*) AS metric_value FROM `sales` GROUP BY DATE_FORMAT(`order_date`, '%Y-%m')"
+
+    monkeypatch.setattr(agent, "_call_chat_completion", fake_call_chat_completion)
+
+    sql = agent._executor_translate_to_sql(
+        {
+            "title": "收入趋势",
+            "query_description": "分析月度收入趋势",
+            "time_plan": {
+                "time_column": "order_date",
+                "grain": "month",
+                "analysis_type": "trend",
+                "comparison_mode": "mom",
+                "lookback_periods": 40,
+            },
+        },
+        {
+            "table_name": "sales",
+            "temporal_dimensions": [
+                {
+                    "column": "order_date",
+                    "candidate_grains": ["week", "month", "quarter"],
+                    "recommended_grains": ["month", "quarter"],
+                    "time_window_limits": {"week": 52, "month": 24, "quarter": 8},
+                }
+            ],
+        },
+        {"api_key": "key"},
+    )
+
+    assert "Selected time plan" in captured["prompt"]
+    assert '"lookback_periods": 24' in captured["prompt"]
+    assert "Only use candidate time columns" in captured["prompt"]
+    assert sql.endswith("LIMIT 100")
+
+
+def test_executor_translate_to_sql_falls_back_when_llm_uses_disallowed_time_column(monkeypatch):
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    monkeypatch.setattr(
+        agent,
+        "_call_chat_completion",
+        lambda system_prompt, user_prompt, api_config: (
+            "SELECT DATE_FORMAT(`created_at`, '%Y-%m') AS period, COUNT(*) AS metric_value "
+            "FROM `sales` GROUP BY DATE_FORMAT(`created_at`, '%Y-%m')"
+        ),
+    )
+
+    sql = agent._executor_translate_to_sql(
+        {
+            "title": "收入趋势",
+            "query_description": "分析月度收入趋势",
+            "time_plan": {
+                "time_column": "order_date",
+                "grain": "month",
+                "analysis_type": "trend",
+                "comparison_mode": "mom",
+                "lookback_periods": 40,
+            },
+        },
+        {
+            "table_name": "sales",
+            "temporal_dimensions": [
+                {
+                    "column": "order_date",
+                    "candidate_grains": ["week", "month", "quarter"],
+                    "recommended_grains": ["month", "quarter"],
+                    "time_window_limits": {"week": 52, "month": 24, "quarter": 8},
+                },
+                {
+                    "column": "created_at",
+                    "candidate_grains": ["day", "week", "month"],
+                    "recommended_grains": ["week", "month"],
+                    "time_window_limits": {"day": 90, "week": 52, "month": 24},
+                },
+            ],
+        },
+        {"api_key": "key"},
+    )
+
+    assert "`order_date`" in sql
+    assert "`created_at`" not in sql
+    assert "INTERVAL 24 MONTH" in sql
 
 
 def test_analyze_table_expert_falls_back_to_deep_on_strategist_failure(monkeypatch):
@@ -502,7 +702,7 @@ def test_analyze_table_expert_falls_back_to_deep_on_strategist_failure(monkeypat
         lambda table_name, safe_table_name=None: {"row_count": 10, "sampled": False, "sample_size": 10, "columns": {}},
     )
     monkeypatch.setattr(agent, "_get_table_metadata", lambda table_name: {"table_name": table_name})
-    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile: [])
+    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile, temporal_dimensions=None: [])
     monkeypatch.setattr(agent, "_call_strategist", lambda prompt, strategist_config: (_ for _ in ()).throw(RuntimeError("R1 unavailable")))
 
     captured = {}
@@ -534,7 +734,7 @@ def test_analyze_table_expert_validates_strategist_api_key_before_call(monkeypat
         lambda table_name, safe_table_name=None: {"row_count": 10, "sampled": False, "sample_size": 10, "columns": {}},
     )
     monkeypatch.setattr(agent, "_get_table_metadata", lambda table_name: {"table_name": table_name})
-    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile: [])
+    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile, temporal_dimensions=None: [])
     monkeypatch.setattr(agent, "_build_strategist_config", lambda: {"model": "deepseek-reasoner", "base_url": "https://api.example.com", "api_key": None})
 
     called = {"strategist": False}
@@ -573,7 +773,11 @@ def test_analyze_table_expert_runs_multiple_rounds_and_truncates_reasoning(monke
         lambda table_name, safe_table_name=None: {"row_count": 10, "sampled": False, "sample_size": 10, "columns": {}},
     )
     monkeypatch.setattr(agent, "_get_table_metadata", lambda table_name: {"table_name": table_name, "description": "sales facts"})
-    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile: [{"title": "rows", "value": 10}])
+    monkeypatch.setattr(
+        agent,
+        "_compute_statistical_facts",
+        lambda safe_name, profile, temporal_dimensions=None: [{"title": "rows", "value": 10}],
+    )
     monkeypatch.setattr(agent, "_build_strategist_config", lambda: {"model": "deepseek-reasoner", "base_url": "https://api.example.com", "api_key": "strategist-key"})
 
     prompts = []
@@ -659,7 +863,7 @@ def test_analyze_table_expert_supports_three_round_synthesis_without_followup_qu
         lambda table_name, safe_table_name=None: {"row_count": 10, "sampled": False, "sample_size": 10, "columns": {}},
     )
     monkeypatch.setattr(agent, "_get_table_metadata", lambda table_name: {"table_name": table_name})
-    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile: [])
+    monkeypatch.setattr(agent, "_compute_statistical_facts", lambda safe_name, profile, temporal_dimensions=None: [])
     monkeypatch.setattr(agent, "_build_strategist_config", lambda: {"model": "deepseek-reasoner", "base_url": "https://api.example.com", "api_key": "strategist-key"})
 
     strategist_outputs = iter(

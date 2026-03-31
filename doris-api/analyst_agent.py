@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+from math import ceil
 import os
 import re
 import time
@@ -32,6 +33,16 @@ _EXPERT_CONTEXT_ROW_LIMIT = 20
 _EXPERT_CONTEXT_COLUMN_LIMIT = 5
 _EXPERT_FALLBACK_DEPTH = "deep"
 _EXPERT_MAIN_SECTION_LIMIT = 3
+_TEMPORAL_GRAIN_ORDER = ("day", "week", "month", "quarter", "year")
+_TEMPORAL_LOOKBACK_DEFAULTS = {
+    "day": 90,
+    "week": 104,
+    "month": 36,
+    "quarter": 16,
+    "year": 10,
+}
+_TEMPORAL_ANALYSIS_TYPES = {"trend", "seasonality", "anomaly", "comparison"}
+_TEMPORAL_COMPARISON_MODES = {"wow", "mom", "qoq", "yoy", "baseline", "none"}
 
 
 class AnalystAgent:
@@ -146,10 +157,20 @@ class AnalystAgent:
                 schedule_id=schedule_id,
                 note=note,
                 error=RuntimeError("No strategist API key configured."),
-            )
+        )
         profile = self._profile_table(raw_table_name, safe_table_name=safe_table_name)
         metadata = self._get_table_metadata(raw_table_name)
-        stats = self._compute_statistical_facts(safe_table_name, profile)
+        temporal_dimensions = self._detect_temporal_dimensions(safe_table_name, profile)
+        if temporal_dimensions:
+            metadata = {
+                **metadata,
+                "temporal_dimensions": temporal_dimensions,
+            }
+        stats = self._compute_statistical_facts(
+            safe_table_name,
+            profile,
+            temporal_dimensions=temporal_dimensions,
+        )
 
         compressed_history: List[Dict[str, Any]] = []
         all_step_results: List[Dict[str, Any]] = []
@@ -690,10 +711,152 @@ class AnalystAgent:
             "response": self._parse_json_from_text(content),
         }
 
+    def _detect_temporal_dimensions(
+        self,
+        safe_name: str,
+        profile: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        columns = profile.get("columns") or {}
+        time_columns = [
+            (name, info)
+            for name, info in columns.items()
+            if self._is_temporal_type(str(info.get("type", "")).lower())
+        ]
+        detected: List[Dict[str, Any]] = []
+
+        for column_name, column_profile in time_columns:
+            safe_column = self.db.validate_identifier(column_name)
+            try:
+                rows = self.db.execute_query(
+                    f"""
+                    SELECT MIN({safe_column}) AS min_value,
+                           MAX({safe_column}) AS max_value,
+                           COUNT({safe_column}) AS non_null_count,
+                           COUNT(DISTINCT DATE({safe_column})) AS distinct_day_count
+                    FROM {safe_name}
+                    WHERE {safe_column} IS NOT NULL
+                    """
+                )
+            except Exception as exc:
+                logger.debug("expert temporal detection failed for %s: %s", column_name, exc)
+                continue
+
+            row = rows[0] if rows else {}
+            min_value = self._coerce_temporal_value(row.get("min_value"))
+            max_value = self._coerce_temporal_value(row.get("max_value"))
+            if not min_value or not max_value:
+                continue
+
+            span_days = max((max_value.date() - min_value.date()).days + 1, 1)
+            distinct_day_count = int(row.get("distinct_day_count") or 0)
+            non_null_count = int(row.get("non_null_count") or 0)
+            density_ratio = round(min(distinct_day_count / span_days, 1.0), 4) if span_days else 0.0
+            candidate_grains = self._candidate_temporal_grains(span_days, density_ratio)
+            recommended_grains = self._recommended_temporal_grains(candidate_grains, span_days)
+            time_window_limits = self._time_window_limits(span_days, candidate_grains)
+
+            detected.append(
+                {
+                    "column": column_name,
+                    "type": column_profile.get("type"),
+                    "null_rate": column_profile.get("null_rate"),
+                    "min_value": str(row.get("min_value")),
+                    "max_value": str(row.get("max_value")),
+                    "non_null_count": non_null_count,
+                    "distinct_day_count": distinct_day_count,
+                    "span_days": span_days,
+                    "density_ratio": density_ratio,
+                    "candidate_grains": candidate_grains,
+                    "recommended_grains": recommended_grains,
+                    "time_window_limits": time_window_limits,
+                }
+            )
+
+        detected.sort(
+            key=lambda item: (
+                -(item.get("span_days") or 0),
+                item.get("null_rate") if item.get("null_rate") is not None else 1.0,
+                item.get("column") or "",
+            )
+        )
+        return detected
+
+    def _coerce_temporal_value(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+            try:
+                return datetime(value.year, value.month, value.day)
+            except TypeError:
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("T", " ")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            return None
+
+    def _candidate_temporal_grains(self, span_days: int, density_ratio: float) -> List[str]:
+        grains: List[str] = []
+        if span_days >= 14 and density_ratio >= 0.35:
+            grains.append("day")
+        if span_days >= 28 and density_ratio >= 0.15:
+            grains.append("week")
+        if span_days >= 60:
+            grains.append("month")
+        if span_days >= 180:
+            grains.append("quarter")
+        if span_days >= 540:
+            grains.append("year")
+        if grains:
+            return grains
+        if span_days >= 60:
+            return ["month"]
+        if span_days >= 28:
+            return ["week"]
+        return ["day"]
+
+    def _recommended_temporal_grains(self, candidate_grains: Sequence[str], span_days: int) -> List[str]:
+        if span_days <= 45:
+            preferred = ["day", "week"]
+        elif span_days <= 210:
+            preferred = ["week", "month"]
+        elif span_days <= 900:
+            preferred = ["month", "quarter"]
+        else:
+            preferred = ["quarter", "year"]
+
+        recommended = [grain for grain in preferred if grain in candidate_grains]
+        if recommended:
+            return recommended[:2]
+        return list(candidate_grains)[:2]
+
+    def _time_window_limits(self, span_days: int, candidate_grains: Sequence[str]) -> Dict[str, int]:
+        available_periods = {
+            "day": span_days,
+            "week": max(1, ceil(span_days / 7)),
+            "month": max(1, ceil(span_days / 30)),
+            "quarter": max(1, ceil(span_days / 90)),
+            "year": max(1, ceil(span_days / 365)),
+        }
+        return {
+            grain: min(_TEMPORAL_LOOKBACK_DEFAULTS[grain], available_periods[grain])
+            for grain in candidate_grains
+            if grain in available_periods
+        }
+
     def _compute_statistical_facts(
         self,
         safe_name: str,
         profile: Dict[str, Any],
+        temporal_dimensions: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         facts: List[Dict[str, Any]] = [
             {
@@ -741,48 +904,19 @@ class AnalystAgent:
                     }
                 )
 
-        if time_cols and numeric_cols:
-            time_column = time_cols[0]
-            safe_time_column = self.db.validate_identifier(time_column)
-            for numeric_column in numeric_cols[:3]:
-                safe_numeric_column = self.db.validate_identifier(numeric_column)
-                try:
-                    growth_rows = self.db.execute_query(
-                        f"""
-                        SELECT DATE_FORMAT({safe_time_column}, '%Y-%m') AS period,
-                               SUM({safe_numeric_column}) AS metric_value
-                        FROM {safe_name}
-                        WHERE {safe_time_column} IS NOT NULL
-                          AND {safe_numeric_column} IS NOT NULL
-                        GROUP BY DATE_FORMAT({safe_time_column}, '%Y-%m')
-                        ORDER BY period DESC
-                        LIMIT 3
-                        """
-                    )
-                except Exception as exc:
-                    logger.debug("expert growth precompute failed for %s: %s", numeric_column, exc)
-                    growth_rows = []
-
-                if len(growth_rows) >= 2:
-                    latest_value = growth_rows[0].get("metric_value")
-                    previous_value = growth_rows[1].get("metric_value")
-                    try:
-                        if previous_value not in (None, 0):
-                            growth_pct = ((float(latest_value) - float(previous_value)) / abs(float(previous_value))) * 100
-                            facts.append(
-                                {
-                                    "type": "growth",
-                                    "column": numeric_column,
-                                    "time_column": time_column,
-                                    "latest_period": growth_rows[0].get("period"),
-                                    "previous_period": growth_rows[1].get("period"),
-                                    "latest_value": latest_value,
-                                    "previous_value": previous_value,
-                                    "growth_pct": round(growth_pct, 2),
-                                }
-                            )
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        pass
+        for dimension in temporal_dimensions or []:
+            facts.append(
+                {
+                    "type": "temporal_dimension",
+                    "column": dimension.get("column"),
+                    "null_rate": dimension.get("null_rate"),
+                    "span_days": dimension.get("span_days"),
+                    "density_ratio": dimension.get("density_ratio"),
+                    "candidate_grains": list(dimension.get("candidate_grains") or []),
+                    "recommended_grains": list(dimension.get("recommended_grains") or []),
+                    "time_window_limits": dict(dimension.get("time_window_limits") or {}),
+                }
+            )
 
         for numeric_column in numeric_cols[:5]:
             safe_numeric_column = self.db.validate_identifier(numeric_column)
@@ -918,6 +1052,16 @@ class AnalystAgent:
                 "Generate 3-5 analytical hypotheses ordered by business value.\n"
                 "Each item must include `id`, `title`, `methodology`, `query_description`, "
                 "`confirm_condition`, and `refute_condition`.\n"
+                "If `temporal_dimension` facts exist in Statistics, choose at most 1-2 temporal analysis plans overall.\n"
+                "For any temporal hypothesis, include a `time_plan` object with:\n"
+                "- `time_column`\n"
+                "- `grain`\n"
+                "- `analysis_type` (trend/seasonality/anomaly/comparison)\n"
+                "- `comparison_mode` (wow/mom/qoq/yoy/baseline/none)\n"
+                "- `lookback_periods`\n"
+                "- optional `metric_column` and `aggregation`\n"
+                "Only choose `time_column` from the listed temporal candidates, only choose `grain` from that column's "
+                "`candidate_grains`, and keep `lookback_periods` within the listed `time_window_limits`.\n"
                 "Return JSON with `hypotheses` and `continue`."
             )
         if round_num == 2:
@@ -926,6 +1070,8 @@ class AnalystAgent:
                 f"Original data context:\n{base_context}\n\n"
                 f"Prior context: {context}\n\n"
                 "Critically evaluate the prior findings.\n"
+                "If you propose temporal follow-ups, include a `time_plan` object using only the listed temporal candidates "
+                "and their allowed grains/window limits.\n"
                 "Return JSON with `assessments`, `follow_ups`, and `continue`."
             )
         return (
@@ -954,6 +1100,7 @@ class AnalystAgent:
                     "id": item.get("id"),
                     "title": item.get("title") or f"Hypothesis {index + 1}",
                     "query_description": item.get("query_description") or item.get("title") or "",
+                    "time_plan": item.get("time_plan"),
                 }
                 for index, item in enumerate(response.get("hypotheses") or [])
                 if item.get("query_description") or item.get("title")
@@ -964,6 +1111,7 @@ class AnalystAgent:
                     "id": item.get("id"),
                     "title": item.get("reason") or f"Follow-up {index + 1}",
                     "query_description": item.get("query_description") or item.get("reason") or "",
+                    "time_plan": item.get("time_plan"),
                 }
                 for index, item in enumerate(response.get("follow_ups") or [])
                 if item.get("query_description") or item.get("reason")
@@ -978,16 +1126,54 @@ class AnalystAgent:
     ) -> str:
         table_name = metadata.get("table_name") or ""
         safe_table_name = self.db.validate_identifier(table_name) if table_name else ""
+        selected_time_plan = self._normalize_time_plan(query.get("time_plan"), metadata)
+        temporal_dimensions = metadata.get("temporal_dimensions") or []
+        temporal_context_lines: List[str] = []
+        if temporal_dimensions:
+            temporal_context_lines.append(
+                "Temporal candidates: "
+                + json.dumps(
+                    [
+                        {
+                            "column": item.get("column"),
+                            "candidate_grains": item.get("candidate_grains"),
+                            "recommended_grains": item.get("recommended_grains"),
+                            "time_window_limits": item.get("time_window_limits"),
+                        }
+                        for item in temporal_dimensions
+                    ],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+        if selected_time_plan:
+            temporal_context_lines.append(
+                "Selected time plan: " + json.dumps(selected_time_plan, ensure_ascii=False, default=str)
+            )
+        temporal_context = "\n".join(temporal_context_lines)
+        temporal_rules = [
+            "- Only use candidate time columns listed in Temporal candidates",
+        ]
+        if selected_time_plan:
+            temporal_rules.extend(
+                [
+                    f"- You must use `{selected_time_plan['time_column']}` as the only time dimension",
+                    f"- You must aggregate at `{selected_time_plan['grain']}` grain",
+                    f"- Restrict the query to the most recent {selected_time_plan['lookback_periods']} {selected_time_plan['grain']} periods",
+                ]
+            )
         prompt = (
             "You are a SQL engineer for Apache Doris. Translate analytical queries to SQL.\n"
             f"Table: {table_name}\n"
             f"Metadata: {json.dumps(metadata, ensure_ascii=False, default=str)}\n"
+            f"{temporal_context}\n"
             f"Query request: {query.get('query_description') or query.get('title') or ''}\n\n"
             "Rules:\n"
             "- Use backtick quoting for all identifiers\n"
             "- Doris syntax (not MySQL-specific features)\n"
             "- Return at most 100 rows (expert mode focuses on patterns, not raw data)\n"
             "- Always alias computed columns for clarity\n"
+            f"{chr(10).join(temporal_rules)}\n"
             "Return only the SQL query."
         )
         try:
@@ -1002,10 +1188,154 @@ class AnalystAgent:
             cleaned = ""
 
         if not cleaned.lower().startswith("select"):
+            if selected_time_plan:
+                return self._build_temporal_fallback_sql(metadata, selected_time_plan)
             return f"SELECT COUNT(*) AS total_rows FROM {safe_table_name}"
+        if selected_time_plan and self._sql_violates_time_plan(cleaned, metadata, selected_time_plan):
+            return self._build_temporal_fallback_sql(metadata, selected_time_plan)
         if " limit " not in cleaned.lower():
             cleaned = f"{cleaned} LIMIT {_EXPERT_RESULT_ROW_LIMIT}"
         return cleaned
+
+    def _normalize_time_plan(
+        self,
+        raw_plan: Any,
+        metadata: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw_plan, dict):
+            return None
+        candidates = {
+            item.get("column"): item
+            for item in (metadata.get("temporal_dimensions") or [])
+            if item.get("column")
+        }
+        time_column = raw_plan.get("time_column")
+        candidate = candidates.get(time_column)
+        if not candidate:
+            return None
+
+        allowed_grains = list(candidate.get("candidate_grains") or [])
+        if not allowed_grains:
+            return None
+        grain = raw_plan.get("grain")
+        if grain not in allowed_grains:
+            grain = (candidate.get("recommended_grains") or allowed_grains)[0]
+
+        limits = candidate.get("time_window_limits") or {}
+        max_lookback = int(limits.get(grain) or _TEMPORAL_LOOKBACK_DEFAULTS.get(grain, 12))
+        raw_lookback = raw_plan.get("lookback_periods")
+        try:
+            lookback_periods = int(raw_lookback) if raw_lookback is not None else max_lookback
+        except (TypeError, ValueError):
+            lookback_periods = max_lookback
+        lookback_periods = max(1, min(lookback_periods, max_lookback))
+
+        analysis_type = str(raw_plan.get("analysis_type") or "trend").lower()
+        if analysis_type not in _TEMPORAL_ANALYSIS_TYPES:
+            analysis_type = "trend"
+        comparison_mode = str(raw_plan.get("comparison_mode") or "none").lower()
+        if comparison_mode not in _TEMPORAL_COMPARISON_MODES:
+            comparison_mode = "none"
+
+        normalized = {
+            "time_column": time_column,
+            "grain": grain,
+            "analysis_type": analysis_type,
+            "comparison_mode": comparison_mode,
+            "lookback_periods": lookback_periods,
+        }
+        metric_column = raw_plan.get("metric_column")
+        if metric_column:
+            normalized["metric_column"] = str(metric_column)
+        aggregation = str(raw_plan.get("aggregation") or "").lower()
+        if aggregation in {"sum", "avg", "count_distinct"}:
+            normalized["aggregation"] = aggregation
+        return normalized
+
+    def _sql_violates_time_plan(
+        self,
+        sql: str,
+        metadata: Dict[str, Any],
+        time_plan: Dict[str, Any],
+    ) -> bool:
+        selected_column = time_plan.get("time_column")
+        if not selected_column:
+            return False
+        temporal_columns = [
+            item.get("column")
+            for item in (metadata.get("temporal_dimensions") or [])
+            if item.get("column")
+        ]
+        if not self._sql_mentions_identifier(sql, selected_column):
+            return True
+        for column in temporal_columns:
+            if column != selected_column and self._sql_mentions_identifier(sql, column):
+                return True
+        return False
+
+    def _sql_mentions_identifier(self, sql: str, identifier: str) -> bool:
+        return re.search(rf"(?<![A-Za-z0-9_])`?{re.escape(identifier)}`?(?![A-Za-z0-9_])", sql or "") is not None
+
+    def _build_temporal_fallback_sql(
+        self,
+        metadata: Dict[str, Any],
+        time_plan: Dict[str, Any],
+    ) -> str:
+        table_name = metadata.get("table_name") or ""
+        safe_table_name = self.db.validate_identifier(table_name)
+        safe_time_column = self.db.validate_identifier(time_plan["time_column"])
+        period_expression = self._temporal_period_expression(safe_time_column, time_plan["grain"])
+        cutoff_expression = self._temporal_cutoff_expression(time_plan["grain"], time_plan["lookback_periods"])
+
+        metric_expression = "COUNT(*)"
+        metric_column = time_plan.get("metric_column")
+        if metric_column:
+            safe_metric = self.db.validate_identifier(str(metric_column))
+            aggregation = time_plan.get("aggregation")
+            if aggregation == "avg":
+                metric_expression = f"AVG({safe_metric})"
+            elif aggregation == "count_distinct":
+                metric_expression = f"COUNT(DISTINCT {safe_metric})"
+            else:
+                metric_expression = f"SUM({safe_metric})"
+
+        return (
+            f"SELECT {period_expression} AS period, {metric_expression} AS metric_value "
+            f"FROM {safe_table_name} "
+            f"WHERE {safe_time_column} IS NOT NULL "
+            f"AND {safe_time_column} >= {cutoff_expression} "
+            f"GROUP BY {period_expression} "
+            f"ORDER BY period DESC "
+            f"LIMIT {_EXPERT_RESULT_ROW_LIMIT}"
+        )
+
+    def _temporal_period_expression(self, safe_time_column: str, grain: str) -> str:
+        if grain == "day":
+            return f"DATE_FORMAT({safe_time_column}, '%Y-%m-%d')"
+        if grain == "week":
+            return (
+                f"CONCAT(CAST(YEAR({safe_time_column}) AS STRING), '-W', "
+                f"LPAD(CAST(WEEKOFYEAR({safe_time_column}) AS STRING), 2, '0'))"
+            )
+        if grain == "month":
+            return f"DATE_FORMAT({safe_time_column}, '%Y-%m')"
+        if grain == "quarter":
+            return (
+                f"CONCAT(CAST(YEAR({safe_time_column}) AS STRING), '-Q', "
+                f"CAST(QUARTER({safe_time_column}) AS STRING))"
+            )
+        return f"CAST(YEAR({safe_time_column}) AS STRING)"
+
+    def _temporal_cutoff_expression(self, grain: str, lookback_periods: int) -> str:
+        if grain == "day":
+            return f"DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_periods} DAY)"
+        if grain == "week":
+            return f"DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_periods} WEEK)"
+        if grain == "month":
+            return f"DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_periods} MONTH)"
+        if grain == "quarter":
+            return f"DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_periods * 3} MONTH)"
+        return f"DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_periods} YEAR)"
 
     def _compress_round_for_context(self, round_data: Dict[str, Any]) -> Dict[str, Any]:
         compressed = {
