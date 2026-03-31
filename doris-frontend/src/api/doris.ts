@@ -144,6 +144,93 @@ export interface UpdateTableRegistryRequest {
   description?: string;
 }
 
+export interface AnalysisInsight {
+  title: string;
+  detail: string;
+  severity?: string;
+}
+
+export interface AnalysisReport {
+  id: string;
+  table_names: string;
+  trigger_type?: string;
+  depth?: string;
+  schedule_id?: string | null;
+  history_id?: string | null;
+  summary?: string;
+  insights?: AnalysisInsight[];
+  anomalies?: any[];
+  recommendations?: string[];
+  failed_step_count?: number;
+  insight_count?: number;
+  anomaly_count?: number;
+  status?: string;
+  duration_ms?: number;
+  created_at?: string;
+  steps?: any[];
+}
+
+export interface AnalysisDeliveryChannel {
+  type: 'webhook' | 'websocket';
+  format?: 'generic' | 'slack' | 'dingtalk';
+  webhook_url?: string;
+  webhook_token?: string;
+}
+
+export interface AnalysisDeliveryConfig {
+  channels: AnalysisDeliveryChannel[];
+}
+
+export interface AnalysisScheduleRequest {
+  name: string;
+  tables: string[];
+  depth?: 'quick' | 'standard' | 'deep';
+  resource_name?: string;
+  schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour?: number;
+  schedule_minute?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  timezone?: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled?: boolean;
+}
+
+export interface AnalysisScheduleUpdateRequest {
+  name?: string;
+  tables?: string[];
+  depth?: 'quick' | 'standard' | 'deep';
+  resource_name?: string;
+  schedule_type?: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour?: number;
+  schedule_minute?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  timezone?: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled?: boolean;
+}
+
+export interface AnalysisSchedule {
+  id: string;
+  name: string;
+  tables: string[];
+  depth: 'quick' | 'standard' | 'deep';
+  resource_name?: string;
+  schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour: number;
+  schedule_minute: number;
+  schedule_day_of_week: number;
+  schedule_day_of_month: number;
+  timezone: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled: boolean;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
 export type UploadImportMode = 'replace' | 'append';
 
 export const dorisApi = {
@@ -205,6 +292,26 @@ export const dorisApi = {
 
   // 自然语言查询 (Text-to-SQL)
   naturalQuery: (data: NaturalQueryRequest) => api.post('/api/query/natural', data),
+
+  // 数据分析
+  analysis: {
+    analyzeTable: (tableName: string, depth: 'quick' | 'standard' | 'deep' = 'standard', resourceName?: string) =>
+      api.post(`/api/analysis/table/${tableName}`, { depth, resource_name: resourceName }),
+    replayHistory: (historyId: string, resourceName?: string) =>
+      api.post(`/api/analysis/replay/${historyId}`, { resource_name: resourceName }),
+    listReports: (params?: { table_names?: string; limit?: number; offset?: number }) =>
+      api.get('/api/analysis/reports', { params }),
+    getReport: (id: string) => api.get(`/api/analysis/reports/${id}`),
+    deleteReport: (id: string) => api.delete(`/api/analysis/reports/${id}`),
+    latestReport: (tableName: string) => api.get(`/api/analysis/reports/latest/${tableName}`),
+    listSchedules: () => api.get('/api/analysis/schedules'),
+    createSchedule: (data: AnalysisScheduleRequest) => api.post('/api/analysis/schedules', data),
+    updateSchedule: (id: string, data: AnalysisScheduleUpdateRequest) =>
+      api.put(`/api/analysis/schedules/${id}`, data),
+    deleteSchedule: (id: string) => api.delete(`/api/analysis/schedules/${id}`),
+    toggleSchedule: (id: string) => api.post(`/api/analysis/schedules/${id}/toggle`),
+    runNow: (id: string) => api.post(`/api/analysis/schedules/${id}/run`),
+  },
 
   // 数据源管理
   datasource: {

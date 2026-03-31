@@ -293,7 +293,7 @@ class VannaDoris(VannaBase):
         """Add documentation to training data (not implemented)"""
         return "Documentation storage not implemented"
 
-    def add_question_sql(self, question: str, sql: str, **kwargs) -> str:
+    def add_question_sql(self, question: str, sql: str, **kwargs) -> Dict[str, Optional[str]]:
         """Persist approved question-SQL pairs into Doris-backed history."""
         normalized_sql = sql.strip().rstrip(";")
         question_hash = self._compute_question_hash(question, normalized_sql)
@@ -305,7 +305,17 @@ class VannaDoris(VannaBase):
         duplicate_rows = self.doris_client.execute_query(duplicate_sql, (question_hash,))
         duplicate_count = int((duplicate_rows[0] or {}).get("count", 0)) if duplicate_rows else 0
         if duplicate_count > 0:
-            return "skipped"
+            existing_rows = self.doris_client.execute_query(
+                """
+                SELECT `id`
+                FROM `_sys_query_history`
+                WHERE `question_hash` = %s
+                LIMIT 1
+                """,
+                (question_hash,),
+            )
+            existing_id = existing_rows[0]["id"] if existing_rows else None
+            return {"status": "skipped", "id": existing_id}
 
         table_names = kwargs.get("table_names") or self.extract_table_names(normalized_sql)
         if isinstance(table_names, str):
@@ -352,12 +362,12 @@ class VannaDoris(VannaBase):
             """
             try:
                 self.doris_client.execute_update(vector_insert_sql, params)
-                return "stored"
+                return {"status": "stored", "id": record_id}
             except Exception as vector_error:
                 logger.warning("vector history insert failed, fallback to scalar insert: %s", vector_error)
 
         self.doris_client.execute_update(insert_sql, params)
-        return "stored"
+        return {"status": "stored", "id": record_id}
 
     def get_training_data(self, **kwargs) -> Any:
         """Get training data (not implemented)"""

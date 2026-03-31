@@ -66,7 +66,8 @@ def test_add_question_sql_persists_question_embedding():
         is_empty_result=False,
     )
 
-    assert result == "stored"
+    assert result["status"] == "stored"
+    assert result["id"]
     assert client.executed_updates, "expected INSERT into _sys_query_history"
     insert_sql, params = client.executed_updates[0]
     assert "question_embedding" in insert_sql

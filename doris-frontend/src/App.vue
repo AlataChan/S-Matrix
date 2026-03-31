@@ -48,6 +48,10 @@
               <search-outlined />
               <span>数据查询</span>
             </a-menu-item>
+            <a-menu-item key="analysis">
+              <fund-outlined />
+              <span>数据分析</span>
+            </a-menu-item>
           </a-menu>
         </a-layout-sider>
 
@@ -58,6 +62,7 @@
           <LLMConfig v-if="selectedKeys[0] === 'llm'" />
           <NaturalQuery v-if="selectedKeys[0] === 'natural'" />
           <DataQuery v-if="selectedKeys[0] === 'query'" />
+          <DataAnalysis v-if="selectedKeys[0] === 'analysis'" />
         </a-layout-content>
       </a-layout>
     </a-layout>
@@ -89,13 +94,14 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
-import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined, CloudSyncOutlined, TableOutlined, KeyOutlined } from '@ant-design/icons-vue';
+import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined, CloudSyncOutlined, TableOutlined, KeyOutlined, FundOutlined } from '@ant-design/icons-vue';
 import ExcelUpload from './components/ExcelUpload.vue';
 import LLMConfig from './components/LLMConfig.vue';
 import NaturalQuery from './components/NaturalQuery.vue';
 import DataQuery from './components/DataQuery.vue';
 import DataSourceSync from './components/DataSourceSync.vue';
 import TableRegistry from './components/TableRegistry.vue';
+import DataAnalysis from './components/DataAnalysis.vue';
 import { dorisApi } from './api/doris';
 import { clearStoredGatewayApiKey, resolveGatewayApiKey, setStoredGatewayApiKey } from './api/auth';
 

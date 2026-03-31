@@ -65,6 +65,10 @@ class AnalystAgent:
         table_name: str,
         depth: str = "standard",
         resource_name: Optional[str] = None,
+        *,
+        trigger_type: str = "table_analysis",
+        schedule_id: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> Dict[str, Any]:
         started_at = time.time()
         raw_table_name = (table_name or "").strip()
@@ -86,9 +90,11 @@ class AnalystAgent:
             profile=profile,
             insights=self._generate_insights(step_results, profile, api_config),
             depth=depth,
-            trigger_type="table_analysis",
+            trigger_type=trigger_type,
             step_results=step_results,
             started_at=started_at,
+            schedule_id=schedule_id,
+            note=note,
         )
         self._save_report(report)
         return report
@@ -97,6 +103,10 @@ class AnalystAgent:
         self,
         history_id: str,
         resource_name: Optional[str] = None,
+        *,
+        trigger_type: str = "history_replay",
+        schedule_id: Optional[str] = None,
+        note: str = "Replayed against current data.",
     ) -> Dict[str, Any]:
         api_config = self.build_api_config(resource_name=resource_name)
         if not api_config.get("api_key"):
@@ -148,11 +158,12 @@ class AnalystAgent:
             profile=profile,
             insights=self._generate_insights(step_results, profile, api_config),
             depth="quick",
-            trigger_type="history_replay",
+            trigger_type=trigger_type,
             step_results=step_results,
             started_at=started_at,
             history_id=history_id,
-            note="Replayed against current data.",
+            schedule_id=schedule_id,
+            note=note,
         )
         self._save_report(report)
         return report

@@ -1682,13 +1682,30 @@ class SyncScheduler:
         self.handler = handler
         self.scheduler = None
 
+    def register(self, shared_scheduler):
+        """在共享调度器上注册同步任务。"""
+        shared_scheduler.register_interval(
+            self._check_and_execute_tasks,
+            minutes=1,
+            job_id="sync_checker",
+        )
+        shared_scheduler.register_cron(
+            self._refresh_agent_catalogs,
+            job_id="field_catalog_refresh",
+            hour=0,
+            minute=0,
+        )
+        print("✅ 同步调度器已注册")
+
     def start(self):
-        """启动调度器"""
+        """兼容旧流程的本地调度器启动。"""
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
 
+            if self.scheduler is not None:
+                return
+            print("⚠️ SyncScheduler.start() is deprecated; use register(app_scheduler) instead.")
             self.scheduler = BackgroundScheduler()
-            # 每分钟检查一次待执行的任务
             self.scheduler.add_job(
                 self._check_and_execute_tasks,
                 'interval',

@@ -103,7 +103,8 @@ def test_add_question_sql_persists_history_with_hash_and_empty_result():
         is_empty_result=True,
     )
 
-    assert result == "stored"
+    assert result["status"] == "stored"
+    assert result["id"]
     assert client.executed_updates, "expected INSERT into _sys_query_history"
     _, params = client.executed_updates[0]
     uuid.UUID(params[0])
@@ -123,7 +124,8 @@ def test_add_question_sql_softly_allows_unregistered_tables():
         is_empty_result=False,
     )
 
-    assert result == "stored"
+    assert result["status"] == "stored"
+    assert result["id"]
     assert client.executed_updates, "soft table validation should not block history writes"
 
 

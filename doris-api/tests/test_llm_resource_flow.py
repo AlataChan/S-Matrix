@@ -72,7 +72,10 @@ def test_natural_query_route_uses_selected_resource_config(monkeypatch):
     main.VannaDorisOpenAI = type(
         "FakeHistoryVanna",
         (),
-        {"__init__": lambda self, *args, **kwargs: None, "add_question_sql": lambda self, *args, **kwargs: "stored"},
+        {
+            "__init__": lambda self, *args, **kwargs: None,
+            "add_question_sql": lambda self, *args, **kwargs: {"status": "stored", "id": "history-1"},
+        },
     )
     main.RepairAgent = type("FakeRepairAgent", (), {"__init__": lambda self, *args, **kwargs: None})
     main.doris_client.execute_query_async = AsyncMock(return_value=[{"total": 1}])

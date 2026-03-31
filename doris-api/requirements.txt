@@ -7,6 +7,7 @@ python-multipart==0.0.12
 pydantic==2.9.2
 cryptography==43.0.1
 requests==2.32.3
+httpx==0.28.1
 cachetools==5.5.0
 DBUtils==3.1.0
 mcp==1.12.4

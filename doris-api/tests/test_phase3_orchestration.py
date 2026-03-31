@@ -229,7 +229,7 @@ def test_natural_query_route_generates_subtask_sql_in_parallel(monkeypatch):
         (),
         {
             "__init__": lambda self, *args, **kwargs: None,
-            "add_question_sql": lambda self, *args, **kwargs: "stored",
+            "add_question_sql": lambda self, *args, **kwargs: {"status": "stored", "id": "history-1"},
         },
     )
     main.RepairAgent = type("FakeRepairAgent", (), {"__init__": lambda self, *args, **kwargs: None})
@@ -294,7 +294,10 @@ def test_natural_query_route_limits_planner_scope_to_selected_tables(monkeypatch
     main.VannaDorisOpenAI = type(
         "FakeHistoryVanna",
         (),
-        {"__init__": lambda self, *args, **kwargs: None, "add_question_sql": lambda self, *args, **kwargs: "stored"},
+        {
+            "__init__": lambda self, *args, **kwargs: None,
+            "add_question_sql": lambda self, *args, **kwargs: {"status": "stored", "id": "history-1"},
+        },
     )
     main.RepairAgent = type("FakeRepairAgent", (), {"__init__": lambda self, *args, **kwargs: None})
     main.datasource_handler.list_relationships_async = AsyncMock(return_value=[])

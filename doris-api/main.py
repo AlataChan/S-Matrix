@@ -1,8 +1,9 @@
 """
 Doris API Gateway - 主程序
 """
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -14,7 +15,9 @@ import re
 import asyncio
 import logging
 import inspect
+import uuid
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from config import API_HOST, API_PORT, DORIS_CONFIG, ANALYST_DEFAULT_DEPTH
 from handlers import action_handler
@@ -28,6 +31,9 @@ from table_admin_agent import TableAdminAgent
 from coordinator_agent import CoordinatorAgent
 from repair_agent import RepairAgent
 from analyst_agent import AnalystAgent
+from app_scheduler import app_scheduler
+from analysis_dispatcher import AnalysisDispatcher
+from analysis_scheduler import AnalysisScheduler
 
 
 @asynccontextmanager
@@ -35,15 +41,23 @@ async def lifespan(application: FastAPI):
     """Application startup/shutdown lifecycle."""
     async def init_in_background():
         global doris_ready
+        loop = asyncio.get_running_loop()
         if doris_ready:
+            if analysis_scheduler is not None:
+                analysis_scheduler.set_event_loop(loop)
             return
         ready = await asyncio.to_thread(_init_doris_sync)
         if ready:
             doris_ready = True
-            sync_scheduler.start()
+            sync_scheduler.register(app_scheduler)
+            if analysis_scheduler is not None:
+                analysis_scheduler.set_event_loop(loop)
+                analysis_scheduler.register(app_scheduler)
+            app_scheduler.start()
 
     asyncio.create_task(init_in_background())
     yield
+    app_scheduler.stop()
 
 
 app = FastAPI(
@@ -57,6 +71,12 @@ app = FastAPI(
 # Global readiness flag for Doris init to avoid 502s after reboot.
 doris_ready = False
 analyst_agent: Optional[AnalystAgent] = None
+analysis_scheduler: Optional[AnalysisScheduler] = None
+analysis_dispatcher: Optional[AnalysisDispatcher] = None
+auto_analysis_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("ANALYST_AUTO_ANALYZE_WORKERS", "2")),
+    thread_name_prefix="analyst-auto",
+)
 logger = logging.getLogger(__name__)
 cors_origins = [
     origin.strip()
@@ -188,7 +208,7 @@ def build_api_config(
 def _init_doris_sync():
     import time
     import pymysql
-    global analyst_agent
+    global analyst_agent, analysis_scheduler, analysis_dispatcher
 
     retry_interval = int(os.getenv("DORIS_INIT_RETRY_INTERVAL", "2"))
     db_name = DORIS_CONFIG["database"]
@@ -247,6 +267,23 @@ def _init_doris_sync():
                 analyst_agent = AnalystAgent(doris_client, build_api_config)
             if not analyst_agent.init_tables():
                 print("Analysis system tables are not ready yet")
+                print(f"Retry in {retry_interval}s...")
+                time.sleep(retry_interval)
+                continue
+            if analysis_dispatcher is None:
+                analysis_dispatcher = AnalysisDispatcher()
+            if analysis_scheduler is None:
+                analysis_scheduler = AnalysisScheduler(
+                    analyst_agent,
+                    doris_client,
+                    dispatcher=analysis_dispatcher,
+                )
+            else:
+                analysis_scheduler.agent = analyst_agent
+                analysis_scheduler.db = doris_client
+                analysis_scheduler.dispatcher = analysis_dispatcher
+            if not analysis_scheduler.init_tables():
+                print("Analysis schedule tables are not ready yet")
                 print(f"Retry in {retry_interval}s...")
                 time.sleep(retry_interval)
                 continue
@@ -381,6 +418,111 @@ def _require_analyst_agent() -> AnalystAgent:
     if analyst_agent is None:
         raise HTTPException(status_code=503, detail="Analyst agent is not initialized yet")
     return analyst_agent
+
+
+class AnalysisScheduleCreateRequest(BaseModel):
+    name: str = Field(..., description="Schedule name")
+    tables: List[str] = Field(..., description="One or more table names")
+    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep")
+    resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
+    schedule_type: str = Field(..., description="Schedule type: hourly/daily/weekly/monthly")
+    schedule_hour: int = Field(default=8, description="Hour (0-23)")
+    schedule_minute: int = Field(default=0, description="Minute (0-59)")
+    schedule_day_of_week: int = Field(default=1, description="ISO day of week (1-7)")
+    schedule_day_of_month: int = Field(default=1, description="Day of month (1-31)")
+    timezone: str = Field(default="UTC", description="IANA timezone name")
+    delivery: Optional[Dict[str, Any]] = Field(default=None, description="Delivery configuration")
+    enabled: bool = Field(default=True, description="Whether the schedule is enabled")
+
+    @field_validator("depth")
+    @classmethod
+    def validate_schedule_depth(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"quick", "standard", "deep"}:
+            raise ValueError("depth must be one of quick, standard, deep")
+        return normalized
+
+    @field_validator("schedule_type")
+    @classmethod
+    def validate_schedule_type(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"hourly", "daily", "weekly", "monthly"}:
+            raise ValueError("schedule_type must be one of hourly, daily, weekly, monthly")
+        return normalized
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        ZoneInfo(value or "UTC")
+        return value
+
+
+class AnalysisScheduleUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, description="Schedule name")
+    tables: Optional[List[str]] = Field(default=None, description="One or more table names")
+    depth: Optional[str] = Field(default=None, description="Analysis depth: quick/standard/deep")
+    resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
+    schedule_type: Optional[str] = Field(default=None, description="Schedule type: hourly/daily/weekly/monthly")
+    schedule_hour: Optional[int] = Field(default=None, description="Hour (0-23)")
+    schedule_minute: Optional[int] = Field(default=None, description="Minute (0-59)")
+    schedule_day_of_week: Optional[int] = Field(default=None, description="ISO day of week (1-7)")
+    schedule_day_of_month: Optional[int] = Field(default=None, description="Day of month (1-31)")
+    timezone: Optional[str] = Field(default=None, description="IANA timezone name")
+    delivery: Optional[Dict[str, Any]] = Field(default=None, description="Delivery configuration")
+    enabled: Optional[bool] = Field(default=None, description="Whether the schedule is enabled")
+
+    @field_validator("depth")
+    @classmethod
+    def validate_optional_schedule_depth(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if normalized not in {"quick", "standard", "deep"}:
+            raise ValueError("depth must be one of quick, standard, deep")
+        return normalized
+
+    @field_validator("schedule_type")
+    @classmethod
+    def validate_optional_schedule_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if normalized not in {"hourly", "daily", "weekly", "monthly"}:
+            raise ValueError("schedule_type must be one of hourly, daily, weekly, monthly")
+        return normalized
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_optional_timezone(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        ZoneInfo(value)
+        return value
+
+
+def _require_analysis_scheduler() -> AnalysisScheduler:
+    if analysis_scheduler is None:
+        raise HTTPException(status_code=503, detail="Analysis scheduler is not initialized yet")
+    return analysis_scheduler
+
+
+def _require_analysis_dispatcher() -> AnalysisDispatcher:
+    if analysis_dispatcher is None:
+        raise HTTPException(status_code=503, detail="Analysis dispatcher is not initialized yet")
+    return analysis_dispatcher
+
+
+def _log_auto_analysis_result(future) -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        logger.warning("auto analysis failed: %s", exc)
+
+
+def _run_auto_analysis(history_id: str, resource_name: Optional[str]) -> None:
+    if analyst_agent is None:
+        return
+    analyst_agent.replay_from_history(history_id, resource_name)
 
 
 class NLQueryRequest(BaseModel):
@@ -807,7 +949,7 @@ async def natural_language_query(request: Dict[str, Any]):
                 raise last_error
 
         try:
-            await asyncio.to_thread(
+            history_result = await asyncio.to_thread(
                 history_vanna.add_question_sql,
                 question=query,
                 sql=final_sql,
@@ -816,6 +958,20 @@ async def natural_language_query(request: Dict[str, Any]):
             )
         except Exception as history_error:
             logger.warning("history persistence failed: %s", history_error)
+            history_result = {"status": "error", "id": None}
+
+        history_id = history_result.get("id") if isinstance(history_result, dict) else None
+        if (
+            history_id
+            and query_result
+            and os.getenv("ANALYST_AUTO_ANALYZE", "false").lower() == "true"
+            and analyst_agent is not None
+        ):
+            auto_analysis_executor.submit(
+                _run_auto_analysis,
+                history_id,
+                request.get("resource_name"),
+            ).add_done_callback(_log_auto_analysis_result)
 
         logger.info(f"=== Query executed successfully, returned {len(query_result)} rows")
 
@@ -917,6 +1073,85 @@ async def analysis_report_delete(report_id: str):
     agent = _require_analyst_agent()
     try:
         return await asyncio.to_thread(agent.delete_report, report_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/analysis/schedules")
+async def create_analysis_schedule(request: AnalysisScheduleCreateRequest):
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(
+            scheduler.create_schedule,
+            request.model_dump(exclude_none=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/analysis/schedules")
+async def list_analysis_schedules():
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(scheduler.list_schedules)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.put("/api/analysis/schedules/{schedule_id}")
+async def update_analysis_schedule(schedule_id: str, request: AnalysisScheduleUpdateRequest):
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(
+            scheduler.update_schedule,
+            schedule_id,
+            request.model_dump(exclude_none=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/analysis/schedules/{schedule_id}")
+async def delete_analysis_schedule(schedule_id: str):
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(scheduler.delete_schedule, schedule_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/analysis/schedules/{schedule_id}/run")
+async def run_analysis_schedule(schedule_id: str):
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(scheduler.run_now, schedule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/analysis/schedules/{schedule_id}/toggle")
+async def toggle_analysis_schedule(schedule_id: str):
+    scheduler = _require_analysis_scheduler()
+    try:
+        return await asyncio.to_thread(scheduler.toggle_schedule, schedule_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1514,6 +1749,50 @@ async def delete_table_registry(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/analysis")
+async def analysis_websocket(ws: WebSocket):
+    try:
+        dispatcher = _require_analysis_dispatcher()
+    except HTTPException as exc:
+        await ws.accept()
+        await ws.close(code=1013, reason=str(exc.detail))
+        return
+
+    expected_api_key = os.getenv("SMATRIX_API_KEY")
+    provided_api_key = ws.query_params.get("api_key")
+    if not expected_api_key:
+        await ws.accept()
+        await ws.close(code=4001, reason="SMATRIX_API_KEY is not configured")
+        return
+    if provided_api_key != expected_api_key:
+        await ws.accept()
+        await ws.close(code=4001, reason="Unauthorized")
+        return
+
+    client_id = str(uuid.uuid4())
+    await dispatcher.ws_connect(ws, client_id)
+    if client_id not in dispatcher.ws_connections:
+        return
+    heartbeat_timeout = float(os.getenv("ANALYST_WS_IDLE_TIMEOUT", "60"))
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.receive_text(), timeout=heartbeat_timeout)
+            except TimeoutError:
+                await ws.close(code=4008, reason="Idle timeout")
+                break
+            if isinstance(message, str) and message.strip().lower() == "ping":
+                await ws.send_text("pong")
+    except WebSocketDisconnect:
+        await dispatcher.ws_disconnect(client_id)
+    except Exception:
+        await dispatcher.ws_disconnect(client_id)
+        raise
+    else:
+        await dispatcher.ws_disconnect(client_id)
+
 
 if __name__ == "__main__":
     uvicorn.run(

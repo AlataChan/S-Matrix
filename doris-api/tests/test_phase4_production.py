@@ -113,7 +113,7 @@ def test_natural_query_auto_repairs_failed_sql(monkeypatch):
 
         def add_question_sql(self, **kwargs):
             self.__class__.calls.append(kwargs)
-            return "stored"
+            return {"status": "stored", "id": "history-1"}
 
     main.VannaDorisOpenAI = RecordingHistoryVanna
     main.doris_client.execute_query_async = AsyncMock(
